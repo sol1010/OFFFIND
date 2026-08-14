@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 import win_focus
 from file_opener import open_result
+from search_worker import SearchWorker
 
 INPUT_HEIGHT = 60
 FOLDER_ROW_HEIGHT = 34
@@ -43,6 +44,12 @@ STYLE = """
 }
 #settingsBtn:hover {
     background-color: rgba(255, 255, 255, 24);
+}
+#loadingLabel {
+    background: transparent;
+    border: none;
+    color: #9aa0a6;
+    font-size: 13px;
 }
 #lineEdit {
     background: transparent;
@@ -498,6 +505,7 @@ class SearchWindow(QWidget):
         self._results = []
         self._row_result_index = []
         self._last_query = None
+        self._search_worker = None
         self._truncated = False
         self._folder_row_shown = False
         self._folder_chip_specs = []
@@ -576,6 +584,14 @@ class SearchWindow(QWidget):
         self.line_edit.setPlaceholderText("검색")
         self.line_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         row_layout.addWidget(self.line_edit, 1)
+
+        # 검색이 백그라운드 스레드에서 도는 동안(1~2글자 검색어는 인덱스를 못 타서
+        # 최대 1초 가까이 걸릴 수 있다) 창이 멈춘 게 아니라 그냥 처리 중이라는 걸
+        # 알려주는 옅은 텍스트 — 결과가 오면 바로 숨는다.
+        self.loading_label = QLabel("검색 중…", input_row)
+        self.loading_label.setObjectName("loadingLabel")
+        self.loading_label.setVisible(False)
+        row_layout.addWidget(self.loading_label)
 
         self.settings_btn = QToolButton(input_row)
         self.settings_btn.setObjectName("settingsBtn")
@@ -1014,12 +1030,14 @@ class SearchWindow(QWidget):
     def _execute_search(self, query: str, force: bool = False):
         if not query:
             self._last_query = None
+            self.loading_label.setVisible(False)
             self._clear_results()
             return
         if len(query) < MIN_QUERY_LENGTH:
             # 한 글자짜리 검색(특히 흔한 영문 한 글자)은 결과가 수천 건씩 쏟아져서
-            # 그 많은 결과 위젯을 다 그리느라 창이 멈춘 것처럼 느려질 수 있다.
+            # 그 많은 결과 위젯을 다 그리느라 검색창이 멈춘 것처럼 느려질 수 있다.
             self._last_query = None
+            self.loading_label.setVisible(False)
             self._results = []
             self._row_result_index = []
             self.results_list.clear()
@@ -1033,7 +1051,21 @@ class SearchWindow(QWidget):
         self._last_query = query
         self._delegate.set_highlight_terms(query.lower().split())
 
-        self._results = self.indexer.search(query, limit=SEARCH_DISPLAY_LIMIT, folder_modes=self._folder_modes())
+        # 검색은 백그라운드 스레드에서 돈다 — 1~2글자 검색어는 trigram 인덱스를 못
+        # 타서 SQLite LIKE 로 전체를 훑는데 1초 가까이 걸릴 수 있는데, 메인 스레드에서
+        # 그대로 부르면 그동안 검색창이 완전히 멈춘 것처럼 보인다. 이전 요청이 아직
+        # 안 끝났어도 그냥 새로 하나 더 띄운다 — 결과가 오면 query 를 대조해서 이미
+        # 지나간(더 최신 검색어로 덮인) 결과는 버리므로 순서 꼬임 걱정은 없다.
+        self.loading_label.setVisible(True)
+        self._search_worker = SearchWorker(self.indexer, query, SEARCH_DISPLAY_LIMIT, self._folder_modes())
+        self._search_worker.finished_ok.connect(self._on_search_finished)
+        self._search_worker.start()
+
+    def _on_search_finished(self, query: str, results: list):
+        if query != self._last_query:
+            return  # 그사이 검색어가 바뀌어서 이제 필요 없어진 결과
+        self.loading_label.setVisible(False)
+        self._results = results
         self._truncated = len(self._results) >= SEARCH_DISPLAY_LIMIT
         self._render_results()
 
