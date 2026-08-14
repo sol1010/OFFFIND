@@ -163,9 +163,18 @@ class Indexer:
                         stat = entry.stat()
                     except OSError:
                         continue
-                    if (has_content and cached.get("mtime") == stat.st_mtime
+                    old_entries = cached.get("entries") if cached else None
+                    # PDF 페이지/엑셀 시트 이동 기능이 추가되기 전에 색인된 캐시는
+                    # entry 안에 "page"/"sheet" 키가 없다. mtime/size 만 보고 "안 바뀌었으니
+                    # 재파싱 안 해도 됨"이라 판단하면, 파일이 실제로 안 바뀐 한 그 구버전
+                    # 데이터가 영원히 재사용돼서 페이지 이동이 계속 안 되는 채로 남는다 —
+                    # 새 entry에 있어야 할 키가 없으면 최신 스키마가 아니라고 보고 다시 파싱한다.
+                    schema_key = "page" if ext == ".pdf" else "sheet"
+                    has_current_schema = not old_entries or schema_key in old_entries[0]
+                    if (has_content and has_current_schema
+                            and cached.get("mtime") == stat.st_mtime
                             and cached.get("size") == stat.st_size):
-                        continue  # 변경 없고 이미 내용까지 색인됨
+                        continue  # 변경 없고 이미 최신 스키마로 내용까지 색인됨
 
                     if progress:
                         progress(name)
@@ -262,7 +271,46 @@ class Indexer:
             wants_filename = any(fo for _, fo in matches)
             wants_content = any(not fo for _, fo in matches)
 
-            if wants_filename:
+            content_hits = []
+            if wants_content:
+                for entry in data.get("entries", []):
+                    text = entry["text"]
+                    text_lower = text.lower()
+                    if not all(t in text_lower for t in terms):
+                        continue
+                    idx = text_lower.find(q_lower)
+                    start = max(0, idx - SNIPPET_RADIUS)
+                    end = min(len(text), idx + len(q_lower) + SNIPPET_RADIUS, start + MAX_SNIPPET_LEN)
+                    snippet = text[start:end]
+                    if start > 0:
+                        snippet = "…" + snippet
+                    if end < len(text):
+                        snippet = snippet + "…"
+                    result = {
+                        "path": path,
+                        "name": os.path.basename(path),
+                        "location": entry["location"],
+                        "snippet": snippet,
+                    }
+                    # 더블클릭 시 파일을 열면서 검색된 위치(엑셀 시트/행, PDF 페이지)로
+                    # 바로 이동할 수 있도록, 있으면 같이 넘긴다.
+                    if "sheet" in entry:
+                        result["sheet"] = entry["sheet"]
+                        result["row"] = entry["row"]
+                    if "page" in entry:
+                        result["page"] = entry["page"]
+                    content_hits.append(result)
+
+            if content_hits:
+                # 같은 파일이 파일명 등록과 내용 등록 둘 다에 걸리면("폴더 두 번 추가")
+                # 내용 일치 쪽이 정확한 위치+미리보기까지 주는 상위 정보라, 굳이 "파일명
+                # 일치"를 따로 또 보여주지 않는다 — 그러면 같은 파일이 결과에 여러 번
+                # 나와서 아무거나 두 개 열면 파일이 두 번 열리는 것처럼 보인다.
+                for result in content_hits:
+                    results.append(result)
+                    if len(results) >= limit:
+                        return results
+            elif wants_filename:
                 name = os.path.basename(path)
                 name_lower = name.lower()
                 if all(t in name_lower for t in terms):
@@ -275,39 +323,6 @@ class Indexer:
                     })
                     if len(results) >= limit:
                         return results
-
-            if not wants_content:
-                continue
-
-            for entry in data.get("entries", []):
-                text = entry["text"]
-                text_lower = text.lower()
-                if not all(t in text_lower for t in terms):
-                    continue
-                idx = text_lower.find(q_lower)
-                start = max(0, idx - SNIPPET_RADIUS)
-                end = min(len(text), idx + len(q_lower) + SNIPPET_RADIUS, start + MAX_SNIPPET_LEN)
-                snippet = text[start:end]
-                if start > 0:
-                    snippet = "…" + snippet
-                if end < len(text):
-                    snippet = snippet + "…"
-                result = {
-                    "path": path,
-                    "name": os.path.basename(path),
-                    "location": entry["location"],
-                    "snippet": snippet,
-                }
-                # 더블클릭 시 파일을 열면서 검색된 위치(엑셀 시트/행, PDF 페이지)로
-                # 바로 이동할 수 있도록, 있으면 같이 넘긴다.
-                if "sheet" in entry:
-                    result["sheet"] = entry["sheet"]
-                    result["row"] = entry["row"]
-                if "page" in entry:
-                    result["page"] = entry["page"]
-                results.append(result)
-                if len(results) >= limit:
-                    return results
         return results
 
     def file_count(self) -> int:
