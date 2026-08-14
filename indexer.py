@@ -53,10 +53,24 @@ CREATE TABLE IF NOT EXISTS content_entries (
     text TEXT NOT NULL,
     page INTEGER,
     sheet TEXT,
-    row_num INTEGER
+    row_num INTEGER,
+    paragraph INTEGER,
+    slide INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_content_entries_file_id ON content_entries(file_id);
 """
+
+_CONTENT_ENTRIES_EXTRA_COLUMNS = {"paragraph": "INTEGER", "slide": "INTEGER"}
+
+
+def _ensure_content_columns(con: sqlite3.Connection):
+    """Word/PowerPoint 지원을 나중에 추가하면서 content_entries 에 paragraph/slide
+    컬럼이 새로 생겼는데, CREATE TABLE IF NOT EXISTS 는 이미 만들어진(예전 버전이
+    만든) 테이블엔 새 컬럼을 안 붙여준다 — 있는지 확인해서 없으면 그때 추가한다."""
+    cols = {row[1] for row in con.execute("PRAGMA table_info(content_entries)")}
+    for col, coltype in _CONTENT_ENTRIES_EXTRA_COLUMNS.items():
+        if col not in cols:
+            con.execute(f"ALTER TABLE content_entries ADD COLUMN {col} {coltype}")
 
 FTS_SCHEMA_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
@@ -111,6 +125,7 @@ def _is_under(path_norm: str, root_norm: str) -> bool:
 def _connect() -> sqlite3.Connection:
     con = sqlite3.connect(CACHE_DB_PATH)
     con.executescript(SCHEMA_SQL)
+    _ensure_content_columns(con)
     con.execute("PRAGMA journal_mode=WAL")  # 백그라운드 색인(쓰기)과 검색(읽기)이 서로 안 막게
     con.execute("PRAGMA foreign_keys=ON")   # 파일 삭제 시 content_entries 도 같이 지워지게(CASCADE)
     return con
@@ -147,14 +162,17 @@ def _term_search_sql(table: str, text_col: str, fts_table: str, select_cols: str
 
 def _content_search_sql(con: sqlite3.Connection, terms: List[str]):
     """terms 전부가 내용 텍스트에 부분일치하는 (path, path_norm, name, location, text,
-    page, sheet, row_num) 행을 반환한다. content_entries 는 files 와 별도 테이블이라
-    files 를 조인해야 하므로 _term_search_sql 의 단일 테이블 가정을 그대로 못 쓴다."""
+    page, sheet, row_num, paragraph, slide) 행을 반환한다. content_entries 는 files 와
+    별도 테이블이라 files 를 조인해야 하므로 _term_search_sql 의 단일 테이블 가정을
+    그대로 못 쓴다."""
+    select_cols = ("f.path, f.path_norm, f.name, ce.location, ce.text, "
+                   "ce.page, ce.sheet, ce.row_num, ce.paragraph, ce.slide")
     if all(len(t) >= 3 for t in terms):
         match_expr = " ".join('"' + t.replace('"', '""') + '"' for t in terms)
         try:
             return con.execute(
-                """
-                SELECT f.path, f.path_norm, f.name, ce.location, ce.text, ce.page, ce.sheet, ce.row_num
+                f"""
+                SELECT {select_cols}
                 FROM content_fts
                 JOIN content_entries ce ON ce.id = content_fts.rowid
                 JOIN files f ON f.id = ce.file_id
@@ -168,7 +186,7 @@ def _content_search_sql(con: sqlite3.Connection, terms: List[str]):
     params = [f"%{t}%" for t in terms]
     return con.execute(
         f"""
-        SELECT f.path, f.path_norm, f.name, ce.location, ce.text, ce.page, ce.sheet, ce.row_num
+        SELECT {select_cols}
         FROM content_entries ce JOIN files f ON f.id = ce.file_id
         WHERE {conds}
         """,
@@ -281,10 +299,11 @@ class Indexer:
                         content_rows.append((
                             file_id, e["location"], e["text"],
                             e.get("page"), e.get("sheet"), e.get("row"),
+                            e.get("paragraph"), e.get("slide"),
                         ))
                 con.executemany(
-                    "INSERT INTO content_entries (file_id, location, text, page, sheet, row_num) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO content_entries (file_id, location, text, page, sheet, row_num, paragraph, slide) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     content_rows,
                 )
             con.executescript(FTS_SCHEMA_SQL)
@@ -478,9 +497,10 @@ class Indexer:
                     con.execute("DELETE FROM content_entries WHERE file_id = ?", (file_id,))
                     if entries:
                         con.executemany(
-                            "INSERT INTO content_entries (file_id, location, text, page, sheet, row_num) "
-                            "VALUES (?, ?, ?, ?, ?, ?)",
-                            [(file_id, e["location"], e["text"], e.get("page"), e.get("sheet"), e.get("row"))
+                            "INSERT INTO content_entries (file_id, location, text, page, sheet, row_num, paragraph, slide) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            [(file_id, e["location"], e["text"], e.get("page"), e.get("sheet"), e.get("row"),
+                              e.get("paragraph"), e.get("slide"))
                              for e in entries],
                         )
 
@@ -576,7 +596,7 @@ class Indexer:
             con.close()
 
         content_by_path: Dict[str, list] = {}
-        for path, path_norm, name, location, text, page, sheet, row_num in content_rows:
+        for path, path_norm, name, location, text, page, sheet, row_num, paragraph, slide in content_rows:
             text_lower = text.lower()
             if not all(t in text_lower for t in terms):
                 continue  # FTS 후보에는 들어왔지만 실제로 전부 포함은 아닐 수 있어 다시 확인
@@ -594,6 +614,10 @@ class Indexer:
                 result["row"] = row_num
             if page is not None:
                 result["page"] = page
+            if paragraph is not None:
+                result["paragraph"] = paragraph
+            if slide is not None:
+                result["slide"] = slide
             content_by_path.setdefault(path, []).append((path_norm, result))
 
         # ---- 파일별로 통합: 폴더 범위 판단 + 파일명/내용 우선순위 ----

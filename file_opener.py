@@ -83,6 +83,42 @@ def _open_excel(path: str, sheet, row):
     os.startfile(path)
 
 
+def _open_word(path: str, paragraph):
+    if paragraph:
+        try:
+            import win32com.client
+            # Excel과 마찬가지로 이미 떠 있는 Word 인스턴스에 붙어버리는 걸 피하려고
+            # DispatchEx로 항상 새 프로세스를 띄운다.
+            word = win32com.client.DispatchEx("Word.Application")
+            word.Visible = True
+            doc = word.Documents.Open(path)
+            try:
+                doc.Paragraphs(paragraph).Range.Select()
+            except Exception:
+                pass  # 문단 이동만 실패한 것 — 파일 자체는 이미 열렸으니 그냥 둔다
+            return
+        except Exception:
+            pass  # Word COM 자동화 실패(Word 미설치 등) — 아래에서 그냥 파일만 연다
+    os.startfile(path)
+
+
+def _open_powerpoint(path: str, slide):
+    if slide:
+        try:
+            import win32com.client
+            ppt = win32com.client.DispatchEx("PowerPoint.Application")
+            ppt.Visible = True
+            pres = ppt.Presentations.Open(path)
+            try:
+                pres.Windows(1).View.GotoSlide(slide)
+            except Exception:
+                pass
+            return
+        except Exception:
+            pass
+    os.startfile(path)
+
+
 def open_result(result: dict):
     """검색 결과 항목을 연다."""
     path = result["path"]
@@ -92,6 +128,10 @@ def open_result(result: dict):
             _open_pdf(path, result["page"])
         elif ext in (".xlsx", ".xlsm") and result.get("sheet"):
             _open_excel(path, result["sheet"], result.get("row"))
+        elif ext == ".docx" and result.get("paragraph"):
+            _open_word(path, result["paragraph"])
+        elif ext == ".pptx" and result.get("slide"):
+            _open_powerpoint(path, result["slide"])
         else:
             os.startfile(path)
     except OSError:
