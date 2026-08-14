@@ -51,6 +51,18 @@ STYLE = """
     color: #9aa0a6;
     font-size: 13px;
 }
+#staleBanner {
+    background-color: rgba(138, 180, 248, 32);
+    color: #8ab4f8;
+    border: none;
+    border-top: 1px solid rgba(255, 255, 255, 20);
+    font-size: 12px;
+    padding: 7px 20px;
+    text-align: left;
+}
+#staleBanner:hover {
+    background-color: rgba(138, 180, 248, 50);
+}
 #lineEdit {
     background: transparent;
     border: none;
@@ -506,6 +518,8 @@ class SearchWindow(QWidget):
         self._row_result_index = []
         self._last_query = None
         self._search_worker = None
+        self._indexing = False
+        self._index_status_text = ""
         self._truncated = False
         self._folder_row_shown = False
         self._folder_chip_specs = []
@@ -573,6 +587,16 @@ class SearchWindow(QWidget):
         self.status_label.setVisible(False)
         card_layout.addWidget(self.status_label)
 
+        # 재색인이 끝났을 때, 지금 보고 있는 검색 결과를 조용히 덮어써버리지 않고
+        # (스크롤 위치·선택 항목이 날아가면 당황스럽다) 대신 눌러야 갱신되는 배너로
+        # 안내한다 — 검색어가 있을 때만 뜬다.
+        self.stale_banner = QPushButton("색인이 갱신됐어요 · 눌러서 다시 검색", self.card)
+        self.stale_banner.setObjectName("staleBanner")
+        self.stale_banner.setCursor(Qt.PointingHandCursor)
+        self.stale_banner.setVisible(False)
+        self.stale_banner.clicked.connect(self._refresh_stale_search)
+        card_layout.addWidget(self.stale_banner)
+
         input_row = DraggableRow(self._on_drag_start, self._on_dragged, self._on_drag_end, self.card)
         input_row.setFixedHeight(INPUT_HEIGHT)
         row_layout = QHBoxLayout(input_row)
@@ -619,7 +643,10 @@ class SearchWindow(QWidget):
     def _base_height(self) -> int:
         # self.folder_row.isVisible()는 창이 숨겨진 동안(hide 직후 등) 항상 False로
         # 나오므로 쓸 수 없다 — 명시적으로 관리하는 플래그를 사용한다.
-        return INPUT_HEIGHT + (FOLDER_ROW_HEIGHT if self._folder_row_shown else 0)
+        height = INPUT_HEIGHT + (FOLDER_ROW_HEIGHT if self._folder_row_shown else 0)
+        if self.stale_banner.isVisible():
+            height += self.stale_banner.sizeHint().height()
+        return height
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1030,14 +1057,16 @@ class SearchWindow(QWidget):
     def _execute_search(self, query: str, force: bool = False):
         if not query:
             self._last_query = None
-            self.loading_label.setVisible(False)
+            self.stale_banner.setVisible(False)
+            self._refresh_status_label()
             self._clear_results()
             return
         if len(query) < MIN_QUERY_LENGTH:
             # 한 글자짜리 검색(특히 흔한 영문 한 글자)은 결과가 수천 건씩 쏟아져서
             # 그 많은 결과 위젯을 다 그리느라 검색창이 멈춘 것처럼 느려질 수 있다.
             self._last_query = None
-            self.loading_label.setVisible(False)
+            self.stale_banner.setVisible(False)
+            self._refresh_status_label()
             self._results = []
             self._row_result_index = []
             self.results_list.clear()
@@ -1049,6 +1078,7 @@ class SearchWindow(QWidget):
         if not force and query == self._last_query:
             return  # 같은 검색어로 중복 검색/재배치 방지 (깜빡임 방지)
         self._last_query = query
+        self.stale_banner.setVisible(False)
         self._delegate.set_highlight_terms(query.lower().split())
 
         # 검색은 백그라운드 스레드에서 돈다 — 1~2글자 검색어는 trigram 인덱스를 못
@@ -1056,18 +1086,57 @@ class SearchWindow(QWidget):
         # 그대로 부르면 그동안 검색창이 완전히 멈춘 것처럼 보인다. 이전 요청이 아직
         # 안 끝났어도 그냥 새로 하나 더 띄운다 — 결과가 오면 query 를 대조해서 이미
         # 지나간(더 최신 검색어로 덮인) 결과는 버리므로 순서 꼬임 걱정은 없다.
-        self.loading_label.setVisible(True)
         self._search_worker = SearchWorker(self.indexer, query, SEARCH_DISPLAY_LIMIT, self._folder_modes())
         self._search_worker.finished_ok.connect(self._on_search_finished)
+        self._refresh_status_label()
         self._search_worker.start()
 
     def _on_search_finished(self, query: str, results: list):
         if query != self._last_query:
             return  # 그사이 검색어가 바뀌어서 이제 필요 없어진 결과
-        self.loading_label.setVisible(False)
+        self._refresh_status_label()
         self._results = results
         self._truncated = len(self._results) >= SEARCH_DISPLAY_LIMIT
         self._render_results()
+
+    def _refresh_status_label(self):
+        """검색 중/색인 중 상태에 따라 loading_label 을 갱신한다. 검색이 더 급한
+        피드백이라 우선순위를 높게 둔다 — 색인 중이어도 검색은 별도 스레드라
+        동시에 돌 수 있다."""
+        if self._search_worker is not None and self._search_worker.isRunning():
+            self.loading_label.setText("검색 중…")
+            self.loading_label.setVisible(True)
+        elif self._indexing:
+            self.loading_label.setText(self._index_status_text)
+            self.loading_label.setVisible(True)
+        else:
+            self.loading_label.setVisible(False)
+
+    # ---------- 색인 진행 상황 (main.App 이 IndexWorker 시그널을 여기로 연결) ----------
+    def on_index_started(self):
+        self._indexing = True
+        self._index_status_text = "색인 중…"
+        self._refresh_status_label()
+
+    def on_index_progress(self, text: str):
+        self._index_status_text = text
+        self._refresh_status_label()
+
+    def on_index_finished(self, _count: int):
+        self._indexing = False
+        self._refresh_status_label()
+        # 지금 보고 있는 검색 결과가 방금 끝난 재색인으로 바뀌었을 수 있다 — 화면을
+        # 조용히 덮어써버리면(스크롤 위치·선택 항목이 날아감) 당황스러우니, 직접
+        # 눌러야 갱신되는 배너로만 알려준다.
+        if self._last_query:
+            self.stale_banner.setVisible(True)
+            self._resize_to_fit()
+
+    def _refresh_stale_search(self):
+        self.stale_banner.setVisible(False)
+        if self._last_query:
+            self._execute_search(self._last_query, force=True)
+        self._resize_to_fit()
 
     def _render_results(self):
         """self._results 를 다시 그린다 (카테고리 접기/펼치기처럼 검색을 새로 하지

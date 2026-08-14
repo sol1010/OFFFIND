@@ -91,7 +91,10 @@ class App:
             else:
                 folder_modes.append((f, filename_only))
         self._worker = IndexWorker(self.indexer, folder_modes)
+        self._worker.progress.connect(self.search_window.on_index_progress)
         self._worker.finished_ok.connect(lambda count: self._on_index_finished(count, silent))
+        self._worker.finished_ok.connect(self.search_window.on_index_finished)
+        self.search_window.on_index_started()
         self._worker.start()
 
     def _on_index_finished(self, count: int, silent: bool = True):

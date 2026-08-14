@@ -11,6 +11,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from typing import Callable, Dict, List, Optional
 
 from config import CACHE_PATH, CACHE_DB_PATH
@@ -342,6 +343,20 @@ class Indexer:
         scanned_roots = []  # 이번 호출에서 실제로 스캔을 시작한 폴더 (stale 정리 범위 제한용)
         denied_paths = []   # 접근거부 등으로 열거 자체를 못한 하위 경로 (stale 정리에서 제외)
 
+        # 진행 상황 알림: 파일마다 emit하면(수십만 번) 신호 폭주로 오히려 느려지니
+        # 일정 시간 간격으로만 보낸다. 콘텐츠 파싱 중 progress(name) 호출도 같은
+        # 스로틀을 공유해서, 짧은 시간에 작은 파일이 여러 개 몰려도 과하게 안 보낸다.
+        _last_progress_at = [0.0]
+
+        def _emit_progress(text: str):
+            if not progress:
+                return
+            now = time.perf_counter()
+            if now - _last_progress_at[0] < 0.2:
+                return
+            _last_progress_at[0] = now
+            progress(text)
+
         # 같은 폴더를 "파일명만"과 "내용까지" 두 가지 방식으로 각각 등록할 수 있는데
         # (설정 화면에서 같은 경로를 두 번 추가), 처리 순서에 따라 filename_only 쪽이
         # 나중에 돌면서 방금 파싱한 내용을 덮어써버릴 수 있다. 내용 모드로도 덮이는
@@ -418,6 +433,7 @@ class Indexer:
                     path = entry.path
                     path_norm = os.path.normcase(os.path.normpath(path))
                     found_paths.add(path_norm)
+                    _emit_progress(f"{len(found_paths):,}개 확인 중…")
 
                     cached = self._meta.get(path_norm)  # (path, is_dir, content_indexed, entries_schema, mtime, size)
                     has_content = cached is not None and cached[2] == 1
@@ -446,8 +462,7 @@ class Indexer:
                     if has_content and same_stat and cached[3] == 1:
                         continue  # 변경 없고 이미 최신 스키마로 내용까지 색인됨
 
-                    if progress:
-                        progress(name)
+                    _emit_progress(f"{name} 읽는 중…")
                     # 개별 추출기(parsers.py)가 각자 내부적으로 예외를 삼키게 되어
                     # 있긴 하지만, 그건 각 추출기 구현이 맞게 짜여 있다는 전제에
                     # 기댄 것이다 — 실제로 그 전제가 깨진 적이 있었다(python-pptx의
