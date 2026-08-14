@@ -1,4 +1,4 @@
-# KS-Finder (엑셀·PDF 내용 검색)
+# OFFFIND (엑셀·PDF 내용 검색)
 
 지정한 폴더 안의 엑셀(.xlsx/.xlsm)과 PDF 파일 내용을 색인해서, 전역 단축키로
 언제든 띄울 수 있는 다크 테마 검색창에서 검색합니다. 결과는 검색창 위쪽으로
@@ -12,10 +12,10 @@
 
 ## 다운로드 (Python 설치 없이 바로 실행)
 
-**[Releases 페이지에서 최신 버전 받기](https://github.com/sol1010/KS-FINDER/releases/latest)**
+**[Releases 페이지에서 최신 버전 받기](https://github.com/sol1010/OFFFIND/releases/latest)**
 
-- `KS-Finder-Setup.exe` — 설치 프로그램 (관리자 권한 불필요)
-- `KS-Finder-portable.zip` — 압축 풀고 바로 실행 (설치 절차 없음)
+- `OFFFIND-Setup.exe` — 설치 프로그램 (관리자 권한 불필요)
+- `OFFFIND-portable.zip` — 압축 풀고 바로 실행 (설치 절차 없음)
 
 ## 실행 (개발용)
 
@@ -50,7 +50,7 @@ pythonw main.py
 
 ## 색인 방식
 
-- 파일의 수정시간/크기를 캐시(`%APPDATA%\KS-Finder\index_cache.json`)에
+- 파일의 수정시간/크기를 캐시(`%APPDATA%\OFFFIND\index_cache.json`)에
   저장해 두고, 변경되지 않은 파일은 다시 파싱하지 않습니다.
 - 앱 시작 시, 검색창을 열 때마다, 그리고 5분마다 자동으로 백그라운드에서
   재색인합니다 — 새로 추가된 파일/폴더도 곧 검색됩니다. 변경 없는 파일은
@@ -75,7 +75,7 @@ pip install -r requirements.txt
 build_exe.bat
 ```
 
-`dist\KS-Finder\KS-Finder.exe` 가 생성됩니다(폴더 형태, PyInstaller `--onedir`).
+`dist\OFFFIND\OFFFIND.exe` 가 생성됩니다(폴더 형태, PyInstaller `--onedir`).
 콘솔창 없이 트레이로 바로 실행됩니다. 폴더 전체를 복사하면 Python이 없는 다른
 컴퓨터에서도 그대로 실행할 수 있습니다.
 
@@ -83,7 +83,7 @@ build_exe.bat
 
 exe를 먼저 빌드한 뒤, [Inno Setup](https://jrsoftware.org/isinfo.php)으로
 `installer.iss`를 컴파일하면 관리자 권한 없이 설치되는(사용자 폴더 설치)
-`KS-Finder-Setup.exe` 설치 프로그램을 만들 수 있습니다.
+`OFFFIND-Setup.exe` 설치 프로그램을 만들 수 있습니다.
 
 ```bash
 build_exe.bat
@@ -99,7 +99,7 @@ build_exe.bat
 | 파일 | 역할 |
 |---|---|
 | `main.py` | 진입점, 전체 모듈 연결 |
-| `config.py` | 설정 로드/저장 (`%APPDATA%\KS-Finder\settings.json`) |
+| `config.py` | 설정 로드/저장 (`%APPDATA%\OFFFIND\settings.json`) |
 | `parsers.py` | 엑셀/PDF 텍스트 추출 |
 | `indexer.py` | 폴더 스캔, 캐시, 검색 로직 |
 | `index_worker.py` | 색인을 백그라운드 스레드에서 실행 |

@@ -1,4 +1,4 @@
-"""KS-Finder 진입점.
+"""OFFFIND 진입점.
 
 폴더 안의 엑셀(xlsx/xlsm) · PDF 파일 내용을 검색하는 항상-실행형 트레이 앱.
 전역 단축키(기본 ctrl+alt+space)로 검색창을 열고 닫는다.

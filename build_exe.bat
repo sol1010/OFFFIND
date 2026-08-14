@@ -1,5 +1,5 @@
 @echo off
-REM KS-Finder 배포용 빌드 (PyInstaller). 콘솔창 없이 실행됨.
+REM OFFFIND 배포용 빌드 (PyInstaller). 콘솔창 없이 실행됨.
 REM
 REM --onefile 대신 --onedir을 쓴다: onefile은 실행할 때마다 임시 폴더에 압축을
 REM 풀어내는 방식이라(자기 자신을 해제하는 동작 패턴) 백신/스마트스크린이 이걸
@@ -13,14 +13,14 @@ REM (정식 코드 서명 인증서가 있어야 없앨 수 있음). "자세히"
 REM pandas/numpy/numba는 코드에서 쓰지 않는데도 pdfplumber가 선택적으로 참조하는
 REM 부분 때문에 PyInstaller가 자동으로 딸려 들어가 용량만 40MB+ 키운다 — 제외한다.
 pyinstaller --noconfirm --onedir --windowed --noupx ^
-    --name KS-Finder ^
-    --icon icon_ks.ico ^
-    --add-data "icon_ks.png;." ^
+    --name OFFFIND ^
+    --icon icon_offfind.ico ^
+    --add-data "icon_offfind.png;." ^
     --exclude-module pandas ^
     --exclude-module numpy ^
     --exclude-module numba ^
     --exclude-module matplotlib ^
     main.py
 echo.
-echo 빌드 완료: dist\KS-Finder\KS-Finder.exe
+echo 빌드 완료: dist\OFFFIND\OFFFIND.exe
 pause

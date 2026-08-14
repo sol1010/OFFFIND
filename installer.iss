@@ -1,9 +1,9 @@
-; KS-Finder 설치 프로그램. build_exe.bat로 dist\KS-Finder 를 먼저 만든 뒤 이 스크립트를
+; OFFFIND 설치 프로그램. build_exe.bat로 dist\OFFFIND 를 먼저 만든 뒤 이 스크립트를
 ; Inno Setup(ISCC.exe)으로 컴파일한다. 관리자 권한이 필요 없도록 사용자 폴더(AppData\Local)에
 ; 설치한다 — 어차피 자동 시작 등록도 HKCU 레지스트리라 관리자 권한 자체가 필요 없다.
-#define MyAppName "KS-Finder"
+#define MyAppName "OFFFIND"
 #define MyAppVersion "1.0"
-#define MyAppExeName "KS-Finder.exe"
+#define MyAppExeName "OFFFIND.exe"
 
 [Setup]
 AppId={{B4E6D9C1-2F3A-4B8E-9C7D-1A2B3C4D5E6F}
@@ -13,8 +13,8 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 PrivilegesRequired=lowest
 OutputDir=installer_output
-OutputBaseFilename=KS-Finder-Setup
-SetupIconFile=icon_ks.ico
+OutputBaseFilename=OFFFIND-Setup
+SetupIconFile=icon_offfind.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2
 SolidCompression=yes

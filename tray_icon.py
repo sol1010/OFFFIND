@@ -15,7 +15,7 @@ class TrayIcon(QObject):
     def __init__(self):
         super().__init__()
         self.tray = QSystemTrayIcon(QIcon(ICON_PATH))
-        self.tray.setToolTip("KS-Finder")
+        self.tray.setToolTip("OFFFIND")
 
         menu = QMenu()
         open_action = menu.addAction("검색창 열기")

@@ -294,7 +294,7 @@ class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.setWindowTitle("KS-Finder 옵션")
+        self.setWindowTitle("OFFFIND 옵션")
         self.setMinimumWidth(520)
         self.setStyleSheet(DIALOG_STYLE)
         self._anchor_x = None

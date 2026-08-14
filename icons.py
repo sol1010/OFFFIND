@@ -15,4 +15,4 @@ def _base_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-ICON_PATH = os.path.join(_base_dir(), "icon_ks.png")
+ICON_PATH = os.path.join(_base_dir(), "icon_offfind.png")
