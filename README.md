@@ -41,7 +41,7 @@ pythonw main.py
 
 ## 색인 방식
 
-- 파일의 수정시간/크기를 캐시(`%APPDATA%\FileSearcher\index_cache.json`)에
+- 파일의 수정시간/크기를 캐시(`%APPDATA%\KS-Finder\index_cache.json`)에
   저장해 두고, 변경되지 않은 파일은 다시 파싱하지 않습니다.
 - 앱 시작 시, 검색창을 열 때마다, 그리고 5분마다 자동으로 백그라운드에서
   재색인합니다 — 새로 추가된 파일/폴더도 곧 검색됩니다. 변경 없는 파일은
@@ -90,7 +90,7 @@ build_exe.bat
 | 파일 | 역할 |
 |---|---|
 | `main.py` | 진입점, 전체 모듈 연결 |
-| `config.py` | 설정 로드/저장 (`%APPDATA%\FileSearcher\settings.json`) |
+| `config.py` | 설정 로드/저장 (`%APPDATA%\KS-Finder\settings.json`) |
 | `parsers.py` | 엑셀/PDF 텍스트 추출 |
 | `indexer.py` | 폴더 스캔, 캐시, 검색 로직 |
 | `index_worker.py` | 색인을 백그라운드 스레드에서 실행 |

@@ -1,10 +1,19 @@
-"""설정 로드/저장 (%APPDATA%\\FileSearcher\\settings.json)"""
+"""설정 로드/저장 (%APPDATA%\\KS-Finder\\settings.json)"""
 import json
 import os
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional
 
-APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "FileSearcher")
+APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "KS-Finder")
+_OLD_APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "FileSearcher")
+if not os.path.exists(APP_DIR) and os.path.exists(_OLD_APP_DIR):
+    # 프로그램 이름을 FileSearcher에서 KS-Finder로 바꾸면서 저장 폴더명도 맞췄는데,
+    # 그냥 두면 예전 이름 폴더에 있던 설정/색인 캐시를 못 찾아서 전부 새로 설정해야
+    # 하는 것처럼 보인다 — 새 폴더가 없고 예전 폴더만 있으면 그대로 옮겨준다.
+    try:
+        os.rename(_OLD_APP_DIR, APP_DIR)
+    except OSError:
+        pass
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 CACHE_PATH = os.path.join(APP_DIR, "index_cache.json")
 
