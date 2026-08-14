@@ -32,6 +32,8 @@ class App:
 
         self._worker = None
         self._settings_dialog = None
+        self._pending_rest_modes = []
+        self._pending_silent = True
 
         self._reindex_timer = QTimer()
         self._reindex_timer.setInterval(AUTO_REINDEX_INTERVAL_MS)
@@ -75,6 +77,23 @@ class App:
             self._start_indexing()
 
     # ---------- 색인 ----------
+    def _folder_modes_split(self):
+        """(선택된 폴더 folder_modes, 나머지 등록된 폴더 folder_modes) 를 반환한다.
+        "선택된"은 검색창 폴더 칩에서 지금 포함된(folder_enabled) 폴더 — 지금 하는
+        검색과 직접 관련 있어서 진행 상황/완료 알림을 검색창에 보여줄 대상이다.
+        "나머지"는 등록은 됐지만 검색창에서 지금 꺼둔 폴더 — 색인 자체는 최신으로
+        유지하되, 검색창에는 아무것도 보여주지 않는다. 이 구분이 없으면 지금 관심도
+        없는(꺼둔) 폴더가 백그라운드에서 스캔될 때도 "색인 갱신됨, 다시 검색하세요"
+        배너가 떠서 혼란스럽다."""
+        selected, rest = [], []
+        for f in self.settings.folders:
+            filename_only = self.settings.folder_filename_only.get(f, False)
+            members = self.settings.folder_groups.get(f)
+            paths = members if members else [f]
+            target = selected if self.settings.folder_enabled.get(f, True) else rest
+            target.extend((p, filename_only) for p in paths)
+        return selected, rest
+
     def _start_indexing(self, silent: bool = True):
         if self._worker is not None and self._worker.isRunning():
             return
@@ -82,19 +101,33 @@ class App:
             if not silent:
                 self.tray.show_message("검색 폴더 없음", "옵션에서 검색할 폴더를 먼저 추가해주세요.")
             return
-        folder_modes = []
-        for f in self.settings.folders:
-            filename_only = self.settings.folder_filename_only.get(f, False)
-            members = self.settings.folder_groups.get(f)
-            if members:
-                folder_modes.extend((m, filename_only) for m in members)
-            else:
-                folder_modes.append((f, filename_only))
-        self._worker = IndexWorker(self.indexer, folder_modes)
-        self._worker.progress.connect(self.search_window.on_index_progress)
+
+        selected_modes, rest_modes = self._folder_modes_split()
+        self._pending_rest_modes = rest_modes
+        self._pending_silent = silent
+
+        if selected_modes:
+            self._worker = IndexWorker(self.indexer, selected_modes)
+            self._worker.progress.connect(self.search_window.on_index_progress)
+            self._worker.finished_ok.connect(self._on_selected_indexing_finished)
+            self.search_window.on_index_started()
+            self._worker.start()
+        else:
+            self._start_rest_indexing()
+
+    def _on_selected_indexing_finished(self, count: int):
+        self.search_window.on_index_finished(count)
+        self._start_rest_indexing()
+
+    def _start_rest_indexing(self):
+        rest_modes = self._pending_rest_modes
+        silent = self._pending_silent
+        if not rest_modes:
+            if not silent:
+                self.tray.show_message("색인 완료", f"{self.indexer.file_count()}개 파일이 색인되었습니다.")
+            return
+        self._worker = IndexWorker(self.indexer, rest_modes)
         self._worker.finished_ok.connect(lambda count: self._on_index_finished(count, silent))
-        self._worker.finished_ok.connect(self.search_window.on_index_finished)
-        self.search_window.on_index_started()
         self._worker.start()
 
     def _on_index_finished(self, count: int, silent: bool = True):
