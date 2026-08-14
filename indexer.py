@@ -211,12 +211,20 @@ class Indexer:
                     snippet = "…" + snippet
                 if end < len(text):
                     snippet = snippet + "…"
-                results.append({
+                result = {
                     "path": path,
                     "name": os.path.basename(path),
                     "location": entry["location"],
                     "snippet": snippet,
-                })
+                }
+                # 더블클릭 시 파일을 열면서 검색된 위치(엑셀 시트/행, PDF 페이지)로
+                # 바로 이동할 수 있도록, 있으면 같이 넘긴다.
+                if "sheet" in entry:
+                    result["sheet"] = entry["sheet"]
+                    result["row"] = entry["row"]
+                if "page" in entry:
+                    result["page"] = entry["page"]
+                results.append(result)
                 if len(results) >= limit:
                     return results
         return results

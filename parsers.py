@@ -22,6 +22,8 @@ def extract_xlsx(path: str) -> List[Dict[str, Any]]:
                 entries.append({
                     "location": f"{sheet.title} · {row_idx}행",
                     "text": text,
+                    "sheet": sheet.title,
+                    "row": row_idx,
                 })
     finally:
         wb.close()
@@ -43,6 +45,7 @@ def extract_pdf(path: str) -> List[Dict[str, Any]]:
                 entries.append({
                     "location": f"{i}페이지",
                     "text": text,
+                    "page": i,
                 })
     except Exception:
         return entries

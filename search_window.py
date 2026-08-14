@@ -4,8 +4,11 @@
 """
 import os
 
-from PySide6.QtCore import Qt, QTimer, Signal, QEvent, QPoint, QRect, QSize, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QKeySequence, QPainter, QShortcut
+from PySide6.QtCore import Qt, QTimer, Signal, QEvent, QPoint, QPointF, QRect, QSize, QPropertyAnimation, QEasingCurve
+from PySide6.QtGui import (
+    QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QKeySequence, QPainter,
+    QShortcut, QTextCharFormat, QTextLayout,
+)
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QLabel, QToolButton,
     QListWidget, QListWidgetItem, QFrame, QSizePolicy, QPushButton,
@@ -13,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 import win_focus
+from file_opener import open_result
 
 INPUT_HEIGHT = 60
 FOLDER_ROW_HEIGHT = 34
@@ -118,6 +122,8 @@ CATEGORY_COLOR = QColor("#9aa0a6")
 CATEGORY_COLOR_HOVER = QColor("#c9cdd2")
 MEMBER_COLOR = QColor("#bdc7d6")
 NOTICE_COLOR = QColor("#f4b95a")
+HIGHLIGHT_COLOR = QColor("#1c1d1f")
+HIGHLIGHT_BG = QColor("#f4d35e")
 
 # 확장자별 분류(폴더별 그룹 안에서의 정리 순서)
 _EXT_CATEGORY = {
@@ -179,7 +185,13 @@ class ResultDelegate(QStyledItemDelegate):
     def __init__(self, parent=None, filename_font_px: int = 10, content_font_px: int = 12,
                  snippet_max_lines: int = 2):
         super().__init__(parent)
+        self._highlight_terms = []
         self.set_config(filename_font_px, content_font_px, snippet_max_lines)
+
+    def set_highlight_terms(self, terms):
+        """지금 검색 중인 단어 목록. 스니펫 안에서 이 단어들과 일치하는 부분을
+        강조해서 그린다(대소문자 무관)."""
+        self._highlight_terms = [t for t in terms if t]
 
     def set_config(self, filename_font_px: int = 10, content_font_px: int = 12,
                     snippet_max_lines: int = 2):
@@ -302,14 +314,50 @@ class ResultDelegate(QStyledItemDelegate):
 
         if result.get("snippet"):
             snippet_rect = QRect(left, next_top, right - left, self._snippet_block_h)
-            painter.setFont(self.snippet_font)
-            painter.setPen(SNIPPET_COLOR)
-            # 문자수로만 대충 잘라서 그리고(정확한 줄바꿈 계산은 하지 않음 — 느림),
-            # 넘치는 부분은 clip으로 가려서 다음 줄과 겹치지 않게만 한다.
-            painter.save()
-            painter.setClipRect(snippet_rect)
-            painter.drawText(snippet_rect, Qt.TextWordWrap, _cap_text(result["snippet"], self._snippet_char_cap))
-            painter.restore()
+            self._draw_snippet(painter, snippet_rect, _cap_text(result["snippet"], self._snippet_char_cap))
+
+    def _draw_snippet(self, painter, rect, text):
+        """스니펫을 그린다. 검색어와 일치하는 부분은 배경을 칠해서 강조한다.
+        QTextLayout으로 줄바꿈은 Qt에 맡기되, 실제로 화면에 그리는 줄은
+        snippet_max_lines로 제한해서(넘치는 줄은 만들지도 않음) 느려지지 않게 한다."""
+        layout = QTextLayout(text, self.snippet_font)
+
+        if self._highlight_terms:
+            lower = text.lower()
+            formats = []
+            hl_format = QTextCharFormat()
+            hl_format.setBackground(HIGHLIGHT_BG)
+            hl_format.setForeground(HIGHLIGHT_COLOR)
+            for term in self._highlight_terms:
+                start = 0
+                while True:
+                    pos = lower.find(term, start)
+                    if pos == -1:
+                        break
+                    fmt_range = QTextLayout.FormatRange()
+                    fmt_range.start = pos
+                    fmt_range.length = len(term)
+                    fmt_range.format = hl_format
+                    formats.append(fmt_range)
+                    start = pos + len(term)
+            layout.setFormats(formats)
+
+        layout.beginLayout()
+        y = 0.0
+        for _ in range(self.snippet_max_lines):
+            line = layout.createLine()
+            if not line.isValid():
+                break
+            line.setLineWidth(rect.width())
+            line.setPosition(QPointF(0, y))
+            y += self.snippet_fm.lineSpacing()
+        layout.endLayout()
+
+        painter.save()
+        painter.setClipRect(rect)
+        painter.setPen(SNIPPET_COLOR)
+        layout.draw(painter, QPointF(rect.left(), rect.top()))
+        painter.restore()
 
 
 HEADER_KINDS = ("folder", "member", "category")
@@ -983,6 +1031,7 @@ class SearchWindow(QWidget):
         if not force and query == self._last_query:
             return  # 같은 검색어로 중복 검색/재배치 방지 (깜빡임 방지)
         self._last_query = query
+        self._delegate.set_highlight_terms(query.lower().split())
 
         self._results = self.indexer.search(query, limit=SEARCH_DISPLAY_LIMIT, folder_modes=self._folder_modes())
         self._truncated = len(self._results) >= SEARCH_DISPLAY_LIMIT
@@ -1162,9 +1211,5 @@ class SearchWindow(QWidget):
         idx = self._row_result_index[row]
         if idx is None or idx >= len(self._results):
             return
-        path = self._results[idx]["path"]
-        try:
-            os.startfile(path)
-        except OSError:
-            pass
+        open_result(self._results[idx])
         self.hide_window()
