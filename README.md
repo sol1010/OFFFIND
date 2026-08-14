@@ -4,6 +4,13 @@
 언제든 띄울 수 있는 다크 테마 검색창에서 검색합니다. 결과는 검색창 위쪽으로
 펼쳐집니다.
 
+## 다운로드 (Python 설치 없이 바로 실행)
+
+**[Releases 페이지에서 최신 버전 받기](https://github.com/sol1010/KS-FINDER/releases/latest)**
+
+- `KS-Finder-Setup.exe` — 설치 프로그램 (관리자 권한 불필요)
+- `KS-Finder-portable.zip` — 압축 풀고 바로 실행 (설치 절차 없음)
+
 ## 실행 (개발용)
 
 ```bash
