@@ -4,6 +4,12 @@
 언제든 띄울 수 있는 다크 테마 검색창에서 검색합니다. 결과는 검색창 위쪽으로
 펼쳐집니다.
 
+<p align="center">
+  <img src="screenshots/idle.png" alt="평소 상태 - 알약 모양 검색창" width="700"><br>
+  <img src="screenshots/search.png" alt="검색 결과 스크린샷" width="700"><br>
+  <img src="screenshots/options.png" alt="옵션 창 스크린샷" width="600">
+</p>
+
 ## 다운로드 (Python 설치 없이 바로 실행)
 
 **[Releases 페이지에서 최신 버전 받기](https://github.com/sol1010/KS-FINDER/releases/latest)**
