@@ -448,7 +448,16 @@ class Indexer:
 
                     if progress:
                         progress(name)
-                    entries = EXTRACTORS[ext](path) if ext in EXTRACTORS else []
+                    # 개별 추출기(parsers.py)가 각자 내부적으로 예외를 삼키게 되어
+                    # 있긴 하지만, 그건 각 추출기 구현이 맞게 짜여 있다는 전제에
+                    # 기댄 것이다 — 실제로 그 전제가 깨진 적이 있었다(python-pptx의
+                    # 예상 못한 None 케이스가 여기까지 새서 색인 스레드 전체가
+                    # 죽었음). 파일 하나의 파싱 실패가 전체 재색인을 멈추게 하면
+                    # 안 되므로, 마지막 방어선으로 한 번 더 감싼다.
+                    try:
+                        entries = EXTRACTORS[ext](path) if ext in EXTRACTORS else []
+                    except Exception:
+                        entries = []
                     _queue_content(path, path_norm, name, stat.st_mtime, stat.st_size, entries)
 
         # 삭제된 파일/폴더 정리: 이번에 실제로 스캔에 성공한 루트 범위 안에서만 지운다
