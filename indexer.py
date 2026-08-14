@@ -125,9 +125,15 @@ class Indexer:
                         dpath = entry.path
                         if filename_only:
                             found_dirs.add(dpath)
-                            if dpath not in self._dirs:
+                            # "path_norm" 없는 항목은 구버전 스키마(예전엔 그냥 빈 dict) —
+                            # search() 가 매 검색마다 normpath/basename 을 다시 계산하지
+                            # 않도록 색인 시점에 한 번만 계산해서 저장해 둔다.
+                            if dpath not in self._dirs or "path_norm" not in self._dirs[dpath]:
                                 with self._lock:
-                                    self._dirs[dpath] = {}
+                                    self._dirs[dpath] = {
+                                        "name": entry.name,
+                                        "path_norm": os.path.normcase(os.path.normpath(dpath)),
+                                    }
                         try:
                             is_link = entry.is_symlink()
                         except OSError:
@@ -147,14 +153,18 @@ class Indexer:
                     has_content = cached is not None and cached.get("content_indexed", True)  # 예전 캐시 호환: 키 없으면 내용 있다고 간주
 
                     if filename_only:
-                        if content_mode_roots:
-                            path_norm = os.path.normcase(os.path.normpath(path))
-                            if any(_is_under(path_norm, r) for r in content_mode_roots):
-                                continue  # 이 파일은 다른 등록이 내용까지 색인하므로 여기선 손대지 않는다
-                        if cached is not None and not has_content:
-                            continue  # 이미 파일명만으로 색인됨 - stat 자체가 필요 없다
+                        path_norm = os.path.normcase(os.path.normpath(path))
+                        if content_mode_roots and any(_is_under(path_norm, r) for r in content_mode_roots):
+                            continue  # 이 파일은 다른 등록이 내용까지 색인하므로 여기선 손대지 않는다
+                        # "path_norm" 없으면 구버전 스키마 — search() 가 매번 다시 계산하지
+                        # 않도록 이번에 한 번 채워 넣는다(파일 자체는 안 바뀌었어도 갱신).
+                        if cached is not None and not has_content and "path_norm" in cached:
+                            continue  # 이미 최신 스키마로 파일명만 색인됨 - stat 자체가 필요 없다
                         with self._lock:
-                            self._files[path] = {"entries": [], "content_indexed": False}
+                            self._files[path] = {
+                                "entries": [], "content_indexed": False,
+                                "name": name, "path_norm": path_norm,
+                            }
                         continue
 
                     # 내용 검색 폴더: entry.stat() 은 scandir 결과에 이미 있는 걸 재사용하는
@@ -170,10 +180,19 @@ class Indexer:
                     # 데이터가 영원히 재사용돼서 페이지 이동이 계속 안 되는 채로 남는다 —
                     # 새 entry에 있어야 할 키가 없으면 최신 스키마가 아니라고 보고 다시 파싱한다.
                     schema_key = "page" if ext == ".pdf" else "sheet"
-                    has_current_schema = not old_entries or schema_key in old_entries[0]
-                    if (has_content and has_current_schema
-                            and cached.get("mtime") == stat.st_mtime
-                            and cached.get("size") == stat.st_size):
+                    has_current_schema = (not old_entries or schema_key in old_entries[0])
+                    same_stat = (cached is not None and cached.get("mtime") == stat.st_mtime
+                                 and cached.get("size") == stat.st_size)
+                    if has_content and has_current_schema and same_stat:
+                        if "path_norm" not in cached:
+                            # 내용(entries)은 이미 최신이라 다시 파싱할 필요는 없고,
+                            # search() 캐시용 name/path_norm 메타데이터만 없는 구버전이라
+                            # 그것만 채워 넣는다 — 파일을 다시 열어 파싱하면(특히 대용량
+                            # PDF/엑셀이면) 이 메타데이터 하나 채우자고 훨씬 비싼 작업을
+                            # 반복하게 된다.
+                            with self._lock:
+                                cached["name"] = name
+                                cached["path_norm"] = os.path.normcase(os.path.normpath(path))
                         continue  # 변경 없고 이미 최신 스키마로 내용까지 색인됨
 
                     if progress:
@@ -185,6 +204,8 @@ class Indexer:
                             "size": stat.st_size,
                             "entries": entries,
                             "content_indexed": True,
+                            "name": name,
+                            "path_norm": os.path.normcase(os.path.normpath(path)),
                         }
 
         # 삭제된 파일/폴더 정리: 이번에 실제로 스캔에 성공한 루트 범위 안에서만 지운다
@@ -228,11 +249,18 @@ class Indexer:
         results = []
         with self._lock:
             items = list(self._files.items())
-            dir_items = list(self._dirs.keys())
+            dir_items = list(self._dirs.items())
 
         allowed_norm = None
         if folder_modes is not None:
-            allowed_norm = [(os.path.normcase(os.path.normpath(f)), bool(fo)) for f, fo in folder_modes]
+            # (루트, 접두사, filename_only) — 접두사(끝에 구분자 붙인 버전)를 여기서 폴더
+            # 개수만큼만 미리 만들어 둔다. _is_under 안에서 매번 만들면 파일 수만큼(수십만
+            # 번) 문자열을 새로 이어붙이게 되는데, 정작 그 값은 루트별로 고정이라 낭비다.
+            allowed_norm = []
+            for f, fo in folder_modes:
+                root_norm = os.path.normcase(os.path.normpath(f))
+                prefix = root_norm if root_norm.endswith(os.sep) else root_norm + os.sep
+                allowed_norm.append((root_norm, prefix, bool(fo)))
 
         def _matched_folders(p_norm: str):
             """p_norm 이 속하는 모든 (폴더_norm, filename_only) 를 반환한다(여러 개 가능 —
@@ -241,15 +269,17 @@ class Indexer:
             취급돼서 다른 쪽 모드의 검색 결과가 아예 안 나오는 문제가 있었다."""
             if allowed_norm is None:
                 return [("", False)]  # 폴더 제한 없음 = 내용 검색으로 취급
-            return [(folder_norm, fo) for folder_norm, fo in allowed_norm if _is_under(p_norm, folder_norm)]
+            return [(root_norm, fo) for root_norm, prefix, fo in allowed_norm
+                    if p_norm == root_norm or p_norm.startswith(prefix)]
 
         # ---- 폴더명 매칭: filename_only 폴더에서만, 폴더 자체를 결과로 보여준다 ----
-        for dpath in dir_items:
-            dpath_norm = os.path.normcase(os.path.normpath(dpath))
+        for dpath, ddata in dir_items:
+            # 색인 시점에 계산해 둔 값 사용 — 구버전 캐시(값이 그냥 {})라 없으면 그때만 계산
+            dpath_norm = ddata.get("path_norm") or os.path.normcase(os.path.normpath(dpath))
             matches = _matched_folders(dpath_norm)
             if not any(fo for _, fo in matches):
                 continue
-            name = os.path.basename(dpath)
+            name = ddata.get("name") or os.path.basename(dpath)
             name_lower = name.lower()
             if all(t in name_lower for t in terms):
                 results.append({
@@ -264,7 +294,7 @@ class Indexer:
 
         # ---- 파일 매칭 ----
         for path, data in items:
-            path_norm = os.path.normcase(os.path.normpath(path))
+            path_norm = data.get("path_norm") or os.path.normcase(os.path.normpath(path))
             matches = _matched_folders(path_norm)
             if not matches:
                 continue
@@ -288,7 +318,7 @@ class Indexer:
                         snippet = snippet + "…"
                     result = {
                         "path": path,
-                        "name": os.path.basename(path),
+                        "name": data.get("name") or os.path.basename(path),
                         "location": entry["location"],
                         "snippet": snippet,
                     }
@@ -311,7 +341,7 @@ class Indexer:
                     if len(results) >= limit:
                         return results
             elif wants_filename:
-                name = os.path.basename(path)
+                name = data.get("name") or os.path.basename(path)
                 name_lower = name.lower()
                 if all(t in name_lower for t in terms):
                     results.append({
