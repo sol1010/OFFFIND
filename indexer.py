@@ -84,6 +84,16 @@ class Indexer:
         scanned_roots = []  # 이번 호출에서 실제로 스캔을 시작한 폴더 (stale 정리 범위 제한용)
         denied_paths = []   # 접근거부 등으로 열거 자체를 못한 하위 경로 (stale 정리에서 제외)
 
+        # 같은 폴더를 "파일명만"과 "내용까지" 두 가지 방식으로 각각 등록할 수 있는데
+        # (설정 화면에서 같은 경로를 두 번 추가), self._files 는 경로 하나당 항목 하나뿐이라
+        # 처리 순서에 따라 filename_only 쪽이 나중에 돌면서 방금 파싱한 내용을 빈 값으로
+        # 덮어써버릴 수 있다. 내용 모드로도 덮이는 경로 범위를 미리 알아두고, filename_only
+        # 처리에서는 그 범위를 건드리지 않는다(내용 모드 쪽이 알아서 채워 넣는다).
+        content_mode_roots = [
+            os.path.normcase(os.path.normpath(f)) for f, fo in folder_modes
+            if not fo and os.path.isdir(f)
+        ]
+
         for folder, filename_only in folder_modes:
             if not os.path.isdir(folder):
                 continue
@@ -137,6 +147,10 @@ class Indexer:
                     has_content = cached is not None and cached.get("content_indexed", True)  # 예전 캐시 호환: 키 없으면 내용 있다고 간주
 
                     if filename_only:
+                        if content_mode_roots:
+                            path_norm = os.path.normcase(os.path.normpath(path))
+                            if any(_is_under(path_norm, r) for r in content_mode_roots):
+                                continue  # 이 파일은 다른 등록이 내용까지 색인하므로 여기선 손대지 않는다
                         if cached is not None and not has_content:
                             continue  # 이미 파일명만으로 색인됨 - stat 자체가 필요 없다
                         with self._lock:
@@ -211,20 +225,20 @@ class Indexer:
         if folder_modes is not None:
             allowed_norm = [(os.path.normcase(os.path.normpath(f)), bool(fo)) for f, fo in folder_modes]
 
-        def _match_folder(p_norm: str):
-            """p_norm 이 속한 (폴더_norm, filename_only) 를 찾는다. 없으면 None."""
+        def _matched_folders(p_norm: str):
+            """p_norm 이 속하는 모든 (폴더_norm, filename_only) 를 반환한다(여러 개 가능 —
+            같은 경로를 파일명만/내용까지 두 가지로 각각 등록했을 수 있다). 예전엔 첫
+            매치 하나만 채택했는데, 그러면 둘 다 등록된 파일은 먼저 나온 등록의 모드로만
+            취급돼서 다른 쪽 모드의 검색 결과가 아예 안 나오는 문제가 있었다."""
             if allowed_norm is None:
-                return ("", False)  # 폴더 제한 없음 = 내용 검색으로 취급
-            for folder_norm, fo in allowed_norm:
-                if _is_under(p_norm, folder_norm):
-                    return (folder_norm, fo)
-            return None
+                return [("", False)]  # 폴더 제한 없음 = 내용 검색으로 취급
+            return [(folder_norm, fo) for folder_norm, fo in allowed_norm if _is_under(p_norm, folder_norm)]
 
         # ---- 폴더명 매칭: filename_only 폴더에서만, 폴더 자체를 결과로 보여준다 ----
         for dpath in dir_items:
             dpath_norm = os.path.normcase(os.path.normpath(dpath))
-            match = _match_folder(dpath_norm)
-            if match is None or not match[1]:
+            matches = _matched_folders(dpath_norm)
+            if not any(fo for _, fo in matches):
                 continue
             name = os.path.basename(dpath)
             name_lower = name.lower()
@@ -242,12 +256,13 @@ class Indexer:
         # ---- 파일 매칭 ----
         for path, data in items:
             path_norm = os.path.normcase(os.path.normpath(path))
-            match = _match_folder(path_norm)
-            if match is None:
+            matches = _matched_folders(path_norm)
+            if not matches:
                 continue
-            filename_only = match[1]
+            wants_filename = any(fo for _, fo in matches)
+            wants_content = any(not fo for _, fo in matches)
 
-            if filename_only:
+            if wants_filename:
                 name = os.path.basename(path)
                 name_lower = name.lower()
                 if all(t in name_lower for t in terms):
@@ -260,6 +275,8 @@ class Indexer:
                     })
                     if len(results) >= limit:
                         return results
+
+            if not wants_content:
                 continue
 
             for entry in data.get("entries", []):
