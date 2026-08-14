@@ -1,6 +1,11 @@
 """폴더를 스캔하여 엑셀/PDF 내용을 색인하고 검색을 제공하는 모듈.
 
-파일의 mtime+size 를 캐시에 저장해 두어, 변경되지 않은 파일은 재파싱하지 않는다.
+내용 검색 대상 파일은 mtime+size 를 캐시에 저장해 두어, 변경되지 않은 파일은
+재파싱하지 않는다. 파일명만 색인하는(filename_only) 폴더는 재파싱할 내용 자체가
+없어 stat 비교가 아무 이득이 없으므로 mtime/size 를 저장하지도, os.stat() 을
+호출하지도 않는다 (os.scandir 순회만으로 충분 — DirEntry 는 Windows에서
+FindFirstFile/FindNextFile 결과를 이미 들고 있어 is_dir()/is_symlink() 가
+추가 시스템 콜 없이 끝난다).
 """
 import json
 import os
@@ -15,10 +20,22 @@ SNIPPET_RADIUS = 220
 MAX_SNIPPET_LEN = 480
 
 
+def _is_under(path_norm: str, root_norm: str) -> bool:
+    """path_norm 이 root_norm 자신이거나 그 아래에 있는지 (둘 다 normcase+normpath 된 값).
+    드라이브 루트("C:\\")는 os.path.normpath 가 이미 끝에 구분자를 붙여서 돌려주는데
+    반해 일반 폴더("C:\\Users\\sol")는 안 붙인다 — 여기서 무조건 os.sep 를 한 번 더
+    붙이면 드라이브 루트일 때 "C:\\\\" 처럼 구분자가 두 번 겹쳐서 그 밑의 어떤 경로와도
+    매칭이 안 되는 버그가 생긴다(이미 구분자로 끝나 있으면 추가하지 않아야 함)."""
+    if path_norm == root_norm:
+        return True
+    prefix = root_norm if root_norm.endswith(os.sep) else root_norm + os.sep
+    return path_norm.startswith(prefix)
+
+
 class Indexer:
     def __init__(self):
         self._lock = threading.Lock()
-        # file_path -> {"mtime": float, "size": int, "entries": [{"location", "text"}]}
+        # file_path -> {"entries": [...], "content_indexed": bool} (내용 색인 시 "mtime"/"size" 도 포함)
         self._files: Dict[str, dict] = {}
         # dir_path -> {} (filename_only 폴더에서만 채워짐, 존재 여부만 의미가 있음)
         self._dirs: Dict[str, dict] = {}
@@ -53,70 +70,117 @@ class Indexer:
         filename_only 폴더는 확장자 제한 없이 모든 파일명을 대상으로 하고, 내용은 파싱하지
         않는다(엑셀/PDF를 열어 읽는 과정을 통째로 건너뛰므로 색인이 훨씬 빠르다 — 파일명
         매핑만 미리 만들어 두는 셈). 하위 폴더 이름도 함께 기록해 폴더명 검색에 쓴다.
-        내용 검색 폴더는 기존처럼 xlsx/pdf만 파싱한다."""
+        내용 검색 폴더는 기존처럼 xlsx/pdf만 파싱한다.
+
+        os.walk 대신 os.scandir 를 명시적 스택으로 직접 순회한다: os.walk 는 이미 읽어온
+        디렉터리 엔트리(FindFirstFile/FindNextFile 결과)를 파일명 문자열로만 넘겨줘서,
+        내용 검색이 필요 없는 filename_only 폴더에서도 mtime/size 비교를 위해 os.stat()을
+        다시 호출하게 되는데, 이게 전체 색인 시간의 대부분(프로파일링 기준 65%)을 차지했다.
+        DirEntry 를 직접 쓰면 그 정보가 이미 있으므로 재요청이 필요 없다. 재귀 대신 스택을
+        쓰는 이유는 아주 깊은 폴더 트리(예: node_modules류)에서 재귀 깊이 제한에 걸리지
+        않기 위해서다."""
         found_paths = set()
         found_dirs = set()
+        scanned_roots = []  # 이번 호출에서 실제로 스캔을 시작한 폴더 (stale 정리 범위 제한용)
+        denied_paths = []   # 접근거부 등으로 열거 자체를 못한 하위 경로 (stale 정리에서 제외)
 
         for folder, filename_only in folder_modes:
             if not os.path.isdir(folder):
                 continue
-            for root, dir_names, files in os.walk(folder):
-                if filename_only:
-                    for d in dir_names:
-                        dpath = os.path.join(root, d)
-                        found_dirs.add(dpath)
-                        if dpath not in self._dirs:
-                            with self._lock:
-                                self._dirs[dpath] = {}
+            scanned_roots.append(os.path.normcase(os.path.normpath(folder)))
 
-                for name in files:
-                    ext = os.path.splitext(name)[1].lower()
-                    if not filename_only and ext not in EXTRACTORS:
-                        continue
-                    path = os.path.join(root, name)
-                    found_paths.add(path)
+            stack = [folder]
+            while stack:
+                if cancel_check and cancel_check():
+                    return
+                current = stack.pop()
+                try:
+                    entries_iter = list(os.scandir(current))
+                except OSError:
+                    # 권한 없음 등으로 이 디렉터리 안을 못 봤으니, 이 하위 트리는 stale
+                    # 정리 대상에서 빼야 한다 — 안 그러면 실제론 그대로 있는 파일이
+                    # "이번에 못 찾았다"는 이유만으로 캐시에서 삭제돼버린다.
+                    denied_paths.append(os.path.normcase(os.path.normpath(current)))
+                    continue
+
+                for entry in entries_iter:
                     if cancel_check and cancel_check():
                         return
                     try:
-                        stat = os.stat(path)
+                        is_dir = entry.is_dir()  # follow_symlinks=True(기본): 링크로 연결된 폴더도 목록엔 포함
                     except OSError:
                         continue
 
+                    if is_dir:
+                        dpath = entry.path
+                        if filename_only:
+                            found_dirs.add(dpath)
+                            if dpath not in self._dirs:
+                                with self._lock:
+                                    self._dirs[dpath] = {}
+                        try:
+                            is_link = entry.is_symlink()
+                        except OSError:
+                            is_link = False
+                        if not is_link:  # os.walk 의 기본 followlinks=False 와 동일하게, 링크 안으로는 재귀 안 함
+                            stack.append(dpath)
+                        continue
+
+                    name = entry.name
+                    ext = os.path.splitext(name)[1].lower()
+                    if not filename_only and ext not in EXTRACTORS:
+                        continue
+                    path = entry.path
+                    found_paths.add(path)
+
                     cached = self._files.get(path)
-                    same_stat = cached and cached.get("mtime") == stat.st_mtime and cached.get("size") == stat.st_size
-                    has_content = cached and cached.get("content_indexed", True)  # 예전 캐시 호환: 키 없으면 내용 있다고 간주
-                    if same_stat and (filename_only or has_content):
-                        continue  # 변경 없고, 지금 필요한 수준(파일명만/내용)까지 이미 색인됨
+                    has_content = cached is not None and cached.get("content_indexed", True)  # 예전 캐시 호환: 키 없으면 내용 있다고 간주
 
                     if filename_only:
-                        entries = []
-                    else:
-                        if progress:
-                            progress(name)
-                        entries = EXTRACTORS[ext](path) if ext in EXTRACTORS else []
+                        if cached is not None and not has_content:
+                            continue  # 이미 파일명만으로 색인됨 - stat 자체가 필요 없다
+                        with self._lock:
+                            self._files[path] = {"entries": [], "content_indexed": False}
+                        continue
 
+                    # 내용 검색 폴더: entry.stat() 은 scandir 결과에 이미 있는 걸 재사용하는
+                    # 것이라 os.stat(path) 와 달리 추가 시스템 콜이 들지 않는다.
+                    try:
+                        stat = entry.stat()
+                    except OSError:
+                        continue
+                    if (has_content and cached.get("mtime") == stat.st_mtime
+                            and cached.get("size") == stat.st_size):
+                        continue  # 변경 없고 이미 내용까지 색인됨
+
+                    if progress:
+                        progress(name)
+                    entries = EXTRACTORS[ext](path) if ext in EXTRACTORS else []
                     with self._lock:
                         self._files[path] = {
                             "mtime": stat.st_mtime,
                             "size": stat.st_size,
                             "entries": entries,
-                            "content_indexed": not filename_only,
+                            "content_indexed": True,
                         }
 
-        # 삭제된 파일/폴더 정리 (filename_only 로 색인된 폴더 범위 안에서만)
-        filename_only_roots = [
-            os.path.normcase(os.path.normpath(f)) for f, fo in folder_modes if fo
-        ]
-
-        def _under_reindexed_root(p: str) -> bool:
+        # 삭제된 파일/폴더 정리: 이번에 실제로 스캔에 성공한 루트 범위 안에서만 지운다
+        # (접근거부로 못 본 하위 트리는 범위에서 제외 — 못 찾은 걸 삭제된 걸로 오인하지 않게).
+        def _under_any(p: str, roots: list) -> bool:
             pn = os.path.normcase(os.path.normpath(p))
-            return any(pn == r or pn.startswith(r + os.sep) for r in filename_only_roots)
+            return any(_is_under(pn, r) for r in roots)
 
         with self._lock:
-            stale = [p for p in self._files if p not in found_paths]
+            stale = [
+                p for p in self._files
+                if p not in found_paths and _under_any(p, scanned_roots) and not _under_any(p, denied_paths)
+            ]
             for p in stale:
                 del self._files[p]
-            stale_dirs = [d for d in self._dirs if d not in found_dirs and _under_reindexed_root(d)]
+            stale_dirs = [
+                d for d in self._dirs
+                if d not in found_dirs and _under_any(d, scanned_roots) and not _under_any(d, denied_paths)
+            ]
             for d in stale_dirs:
                 del self._dirs[d]
 
@@ -152,7 +216,7 @@ class Indexer:
             if allowed_norm is None:
                 return ("", False)  # 폴더 제한 없음 = 내용 검색으로 취급
             for folder_norm, fo in allowed_norm:
-                if p_norm == folder_norm or p_norm.startswith(folder_norm + os.sep):
+                if _is_under(p_norm, folder_norm):
                     return (folder_norm, fo)
             return None
 
