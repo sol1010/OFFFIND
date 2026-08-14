@@ -574,23 +574,40 @@ class SettingsDialog(QDialog):
         self.preview_content_label.setFixedHeight(line_h * lines)
 
     def _add_folder_row(self, key: str, display_name: str = "", filename_only: bool = False,
-                         is_group: bool = False, member_count: int = 0, row: int = None):
+                         is_group: bool = False, member_count: int = 0, row: int = None,
+                         real_path: str = None):
+        """real_path: 같은 폴더를 다른 검색 방식으로 한 번 더 추가한 항목(멤버 1개짜리
+        그룹으로 내부 저장됨)일 때만 넘긴다 — 그룹 UI("🔗 그룹 · N개 폴더") 대신 실제
+        폴더 이름을 그대로 보여줘서, 진짜 여러 폴더를 묶은 그룹과 헷갈리지 않게 한다."""
         if row is None:
             row = self.folder_table.rowCount()
         self.folder_table.insertRow(row)
 
-        path_text = self._group_row_text(key, member_count) if is_group else key
+        if real_path is not None:
+            path_text = real_path
+        elif is_group:
+            path_text = self._group_row_text(key, member_count)
+        else:
+            path_text = key
         item = QTableWidgetItem(path_text)
         item.setFlags(item.flags() & ~Qt.ItemIsEditable)
         item.setData(ROLE_KEY, key)  # 실제 식별자(경로 또는 그룹 키)는 따로 저장
         item.setData(ROLE_KIND, "primary")
-        if is_group:
+        if real_path is not None:
+            item.setToolTip(f"{real_path}\n(같은 폴더를 다른 검색 방식으로 한 번 더 추가한 항목)")
+        elif is_group:
             item.setToolTip("클릭하면 펼쳐져서 멤버 폴더별 표시 이름을 편집할 수 있습니다.")
         self.folder_table.setItem(row, 0, item)
 
         name_edit = QLineEdit()
         name_edit.setObjectName("cellLineEdit")
-        name_edit.setPlaceholderText("그룹 이름" if is_group else (os.path.basename(key.rstrip("\\/")) or key))
+        if real_path is not None:
+            placeholder = os.path.basename(real_path.rstrip("\\/")) or real_path
+        elif is_group:
+            placeholder = "그룹 이름"
+        else:
+            placeholder = os.path.basename(key.rstrip("\\/")) or key
+        name_edit.setPlaceholderText(placeholder)
         name_edit.setText(display_name)
         self.folder_table.setCellWidget(row, 1, name_edit)
 
@@ -616,6 +633,20 @@ class SettingsDialog(QDialog):
         return [self._row_key(r) for r in range(self.folder_table.rowCount())
                 if self._row_kind(r) == "primary"]
 
+    def _all_registered_paths(self) -> set:
+        """지금 표에 등록된 모든 실제 폴더 경로(일반 폴더 + 모든 그룹의 멤버 폴더 전부).
+        그룹 안에 숨어있는 멤버는 최상위 행이 아니라서 _existing_folders() 만으론 못
+        잡는다 — 이걸 빼먹으면 그룹 안에 있는 폴더를 다시 골랐을 때 "이미 등록됨"을
+        감지 못 하고 조용히 또 다른 최상위 행으로 추가돼버린다."""
+        paths = set()
+        for key in self._existing_folders():
+            members = self._group_members.get(key)
+            if members:
+                paths.update(members)
+            else:
+                paths.add(key)
+        return paths
+
     # ---------- 그룹 펼치기/접기 (멤버 표시 이름 인라인 편집) ----------
     def _on_cell_clicked(self, row: int, col: int):
         if col != 0:
@@ -624,8 +655,9 @@ class SettingsDialog(QDialog):
         if item is None or item.data(ROLE_KIND) != "primary":
             return
         key = item.data(ROLE_KEY)
-        if key not in self._group_members:
-            return
+        members = self._group_members.get(key)
+        if not members or len(members) < 2:
+            return  # 멤버 1개짜리("같은 폴더를 다른 방식으로 추가")는 펼칠 게 없다
         if key in self._expanded_groups:
             self._collapse_group(key)
         else:
@@ -696,10 +728,28 @@ class SettingsDialog(QDialog):
 
     def _add_folder(self):
         path = QFileDialog.getExistingDirectory(self, "검색할 폴더 선택")
-        if path and path not in self._existing_folders():
+        if not path:
+            return
+        if path not in self._all_registered_paths():
             # 새로 추가하는 폴더는 기본적으로 파일명만 검색(내용은 안 읽음) —
             # 내용 검색이 필요한 폴더만 표에서 직접 바꿔주면 된다.
             self._add_folder_row(path, filename_only=True)
+            return
+
+        # 이미 등록된 폴더(그룹 안에 숨어있는 경우 포함) — 다른 검색 방식으로 한 번
+        # 더 추가할 수 있게 해준다. 멤버 1개짜리 그룹으로 저장하면, 색인/검색 쪽은
+        # 이미 그룹 멤버를 실제 경로로 풀어 쓰고 있어서 코드 변경 없이 그대로 동작한다.
+        reply = QMessageBox.question(
+            self, "이미 등록된 폴더",
+            f"'{path}'는 이미 등록되어 있습니다(그룹 안에 있을 수도 있습니다).\n"
+            "다른 검색 방식(예: 내용까지 검색)으로 한 번 더 추가할까요?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        dup_key = GROUP_PREFIX + uuid.uuid4().hex[:12]
+        self._group_members[dup_key] = [path]
+        self._add_folder_row(dup_key, filename_only=True, real_path=path)
 
     def _remove_folder(self):
         # 선택 대상은 selectedIndexes()가 항상 primary 행만 준다(member 서브행은
