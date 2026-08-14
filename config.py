@@ -21,7 +21,8 @@ if not os.path.exists(APP_DIR):
                 pass
             break
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
-CACHE_PATH = os.path.join(APP_DIR, "index_cache.json")
+CACHE_PATH = os.path.join(APP_DIR, "index_cache.json")  # 예전 형식 - SQLite로 옮긴 뒤엔 1회성 마이그레이션 출처로만 쓰임
+CACHE_DB_PATH = os.path.join(APP_DIR, "index_cache.db")
 
 DEFAULTS = {
     # 폴더 목록 관련 항목은 사용자마다 다르므로 비워둔 채로 유지한다(첫 실행 시

@@ -1,23 +1,99 @@
 """폴더를 스캔하여 엑셀/PDF 내용을 색인하고 검색을 제공하는 모듈.
 
-내용 검색 대상 파일은 mtime+size 를 캐시에 저장해 두어, 변경되지 않은 파일은
-재파싱하지 않는다. 파일명만 색인하는(filename_only) 폴더는 재파싱할 내용 자체가
-없어 stat 비교가 아무 이득이 없으므로 mtime/size 를 저장하지도, os.stat() 을
-호출하지도 않는다 (os.scandir 순회만으로 충분 — DirEntry 는 Windows에서
-FindFirstFile/FindNextFile 결과를 이미 들고 있어 is_dir()/is_symlink() 가
-추가 시스템 콜 없이 끝난다).
+파일명·폴더명·내용(엑셀 행/PDF 페이지) 전부 SQLite + FTS5(trigram 토크나이저)로
+색인한다. 예전엔 파일 61만 개, 내용 항목 135만 개를 매 키 입력마다 Python 레벨에서
+전부 훑었는데(검색 한 번에 3~4초 이상), trigram 인덱스를 쓰면 3글자 이상 검색어는
+실측 수십 ms 안팎으로 끝난다. trigram은 구조상 3글자 미만 질의를 인덱싱하지 못하므로
+(3글자 미만은 트라이그램 자체가 안 생김) 2글자 이하는 LIKE 로 폴백한다 — 그래도
+SQLite C 엔진이라 Python 반복문보다 빠르다.
 """
 import json
 import os
+import sqlite3
 import threading
 from typing import Callable, Dict, List, Optional
 
-from config import CACHE_PATH
+from config import CACHE_PATH, CACHE_DB_PATH
 from parsers import EXTRACTORS
 
 MAX_RESULTS = 5000  # 결과 목록이 가상화되어 있어(보이는 행만 그림) 이 정도는 가볍게 처리된다
 SNIPPET_RADIUS = 220
 MAX_SNIPPET_LEN = 480
+
+# 트리거/FTS5 가상 테이블을 만들기 "전에" 원본 테이블에 대량으로 넣어야 하는 경우가
+# 있어서(최초 JSON 마이그레이션 — 수십만~100만 건을 한 건씩 트리거로 FTS 색인하면
+# 몇 분씩 걸린다, 실측으로 확인함) 스키마를 세 조각으로 나눠 둔다. 평소(이미 DB가
+# 있는 정상 실행)엔 그냥 합쳐서 쓴다.
+BASE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS files (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL,
+    path_norm TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    is_dir INTEGER NOT NULL,
+    content_indexed INTEGER NOT NULL DEFAULT 0,
+    entries_schema INTEGER NOT NULL DEFAULT 0,
+    mtime REAL,
+    size INTEGER
+);
+-- 동일성 판단은 항상 path_norm(정규화된 경로) 기준이어야 한다: 같은 물리적 파일도
+-- 어느 등록 루트를 거쳐 스캔됐는지에 따라 os.scandir 가 만드는 path 문자열의
+-- 구분자 표기(슬래시/백슬래시)가 달라질 수 있다(예: "C:/" 루트로 스캔한 파일은
+-- "C:/Users\\sol\\..." 인데, "C:/Users/sol/Downloads" 루트로 스캔한 같은 파일은
+-- "C:/Users/sol/Downloads\\..." 가 됨 — 둘 다 os.path.normpath 를 거치면 같아진다).
+-- path 자체를 UNIQUE 로 쓰면 이 표기 차이 때문에 같은 파일이 두 행으로 중복
+-- 색인되고, 검색 결과 dedup(파일명+내용 둘 다 걸린 파일은 내용 쪽만 보여주기)이
+-- 깨진다(실측으로 발견함 — 파일명 일치/내용 일치가 같은 파일인데 따로 나왔었음).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_path_norm ON files(path_norm);
+
+CREATE TABLE IF NOT EXISTS content_entries (
+    id INTEGER PRIMARY KEY,
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    location TEXT NOT NULL,
+    text TEXT NOT NULL,
+    page INTEGER,
+    sheet TEXT,
+    row_num INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_content_entries_file_id ON content_entries(file_id);
+"""
+
+FTS_SCHEMA_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+    name, content='files', content_rowid='id', tokenize='trigram'
+);
+CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+    INSERT INTO files_fts(rowid, name) VALUES (new.id, new.name);
+END;
+CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+    INSERT INTO files_fts(files_fts, rowid, name) VALUES ('delete', old.id, old.name);
+END;
+CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
+    INSERT INTO files_fts(files_fts, rowid, name) VALUES ('delete', old.id, old.name);
+    INSERT INTO files_fts(rowid, name) VALUES (new.id, new.name);
+END;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(
+    text, content='content_entries', content_rowid='id', tokenize='trigram'
+);
+CREATE TRIGGER IF NOT EXISTS content_ai AFTER INSERT ON content_entries BEGIN
+    INSERT INTO content_fts(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS content_ad AFTER DELETE ON content_entries BEGIN
+    INSERT INTO content_fts(content_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+"""
+
+SCHEMA_SQL = BASE_SCHEMA_SQL + FTS_SCHEMA_SQL
+
+_UPSERT_FILE_SQL = """
+INSERT INTO files (path, path_norm, name, is_dir, content_indexed, entries_schema, mtime, size)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(path_norm) DO UPDATE SET
+    path=excluded.path, name=excluded.name, is_dir=excluded.is_dir,
+    content_indexed=excluded.content_indexed, entries_schema=excluded.entries_schema,
+    mtime=excluded.mtime, size=excluded.size
+"""
 
 
 def _is_under(path_norm: str, root_norm: str) -> bool:
@@ -32,34 +108,194 @@ def _is_under(path_norm: str, root_norm: str) -> bool:
     return path_norm.startswith(prefix)
 
 
+def _connect() -> sqlite3.Connection:
+    con = sqlite3.connect(CACHE_DB_PATH)
+    con.executescript(SCHEMA_SQL)
+    con.execute("PRAGMA journal_mode=WAL")  # 백그라운드 색인(쓰기)과 검색(읽기)이 서로 안 막게
+    con.execute("PRAGMA foreign_keys=ON")   # 파일 삭제 시 content_entries 도 같이 지워지게(CASCADE)
+    return con
+
+
+def _term_search_sql(table: str, text_col: str, fts_table: str, select_cols: str,
+                      con: sqlite3.Connection, terms: List[str], extra_where: str = "",
+                      extra_params: tuple = ()):
+    """terms 전부가 text_col 에 부분일치하는 행을 반환한다. 전부 3글자 이상이면
+    FTS5(trigram) MATCH — 인덱스를 타서 매칭되는 것만 바로 찾는다. 하나라도 2글자
+    이하면 trigram 인덱스가 토큰 자체를 안 만들어서 매칭이 안 되므로 LIKE 로
+    폴백한다(전량 스캔이지만 SQLite C 엔진이라 Python 반복문보다 빠르다)."""
+    where = f" AND {extra_where}" if extra_where else ""
+    if all(len(t) >= 3 for t in terms):
+        match_expr = " ".join('"' + t.replace('"', '""') + '"' for t in terms)
+        try:
+            return con.execute(
+                f"""
+                SELECT {select_cols} FROM {fts_table}
+                JOIN {table} t ON t.id = {fts_table}.rowid
+                WHERE {fts_table} MATCH ?{where}
+                """,
+                (match_expr, *extra_params),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            pass  # 검색어에 FTS5 구문을 깨는 문자가 있으면 LIKE 로 안전하게 폴백
+    conds = " AND ".join([f"t.{text_col} LIKE ?"] * len(terms))
+    params = [f"%{t}%" for t in terms]
+    return con.execute(
+        f"SELECT {select_cols} FROM {table} t WHERE {conds}{where}",
+        [*params, *extra_params],
+    ).fetchall()
+
+
+def _content_search_sql(con: sqlite3.Connection, terms: List[str]):
+    """terms 전부가 내용 텍스트에 부분일치하는 (path, path_norm, name, location, text,
+    page, sheet, row_num) 행을 반환한다. content_entries 는 files 와 별도 테이블이라
+    files 를 조인해야 하므로 _term_search_sql 의 단일 테이블 가정을 그대로 못 쓴다."""
+    if all(len(t) >= 3 for t in terms):
+        match_expr = " ".join('"' + t.replace('"', '""') + '"' for t in terms)
+        try:
+            return con.execute(
+                """
+                SELECT f.path, f.path_norm, f.name, ce.location, ce.text, ce.page, ce.sheet, ce.row_num
+                FROM content_fts
+                JOIN content_entries ce ON ce.id = content_fts.rowid
+                JOIN files f ON f.id = ce.file_id
+                WHERE content_fts MATCH ?
+                """,
+                (match_expr,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            pass  # 검색어에 FTS5 구문을 깨는 문자가 있으면 LIKE 로 안전하게 폴백
+    conds = " AND ".join(["ce.text LIKE ?"] * len(terms))
+    params = [f"%{t}%" for t in terms]
+    return con.execute(
+        f"""
+        SELECT f.path, f.path_norm, f.name, ce.location, ce.text, ce.page, ce.sheet, ce.row_num
+        FROM content_entries ce JOIN files f ON f.id = ce.file_id
+        WHERE {conds}
+        """,
+        params,
+    ).fetchall()
+
+
+_INSERT_FILE_RETURNING_ID_SQL = """
+INSERT INTO files (path, path_norm, name, is_dir, content_indexed, entries_schema, mtime, size)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(path_norm) DO UPDATE SET
+    path=excluded.path, name=excluded.name, is_dir=excluded.is_dir,
+    content_indexed=excluded.content_indexed, entries_schema=excluded.entries_schema,
+    mtime=excluded.mtime, size=excluded.size
+RETURNING id
+"""
+
+
 class Indexer:
     def __init__(self):
         self._lock = threading.Lock()
-        # file_path -> {"entries": [...], "content_indexed": bool} (내용 색인 시 "mtime"/"size" 도 포함)
-        self._files: Dict[str, dict] = {}
-        # dir_path -> {} (filename_only 폴더에서만 채워짐, 존재 여부만 의미가 있음)
-        self._dirs: Dict[str, dict] = {}
-        self._load_cache()
+        os.makedirs(os.path.dirname(CACHE_DB_PATH), exist_ok=True)
 
-    # ---------- 캐시 ----------
-    def _load_cache(self):
-        if not os.path.exists(CACHE_PATH):
-            return
+        if not os.path.exists(CACHE_DB_PATH) and os.path.exists(CACHE_PATH):
+            self._migrate_json_cache()
+
+        con = _connect()
+        try:
+            # rebuild() 가 파일마다 "이미 색인됐는지" 판단할 때 SQLite 왕복 없이 바로
+            # 확인할 수 있도록, 가벼운 메타데이터만(내용 텍스트는 빼고) 메모리에 올려
+            # 둔다 — 내용 자체는 이제 content_fts 인덱스로 바로 검색하므로 메모리에
+            # 따로 들고 있을 필요가 없다.
+            # path_norm(정규화된 경로)을 키로 쓴다 — 같은 물리적 파일이 등록 루트에
+            # 따라 다른 구분자 표기의 path 문자열로 발견될 수 있어서, "이미 색인된
+            # 파일인가?"는 항상 path_norm 기준으로 판단해야 한다.
+            self._meta: Dict[str, tuple] = {}
+            for path, path_norm, is_dir, content_indexed, entries_schema, mtime, size in con.execute(
+                "SELECT path, path_norm, is_dir, content_indexed, entries_schema, mtime, size FROM files"
+            ):
+                self._meta[path_norm] = (path, is_dir, content_indexed, entries_schema, mtime, size)
+        finally:
+            con.close()
+
+    def _migrate_json_cache(self):
+        """예전 JSON 캐시를 SQLite로 1회성으로 옮긴다. FTS5 가상 테이블/트리거를 만들기
+        전에 원본 테이블부터 통째로 채우고, 그 다음 FTS 인덱스를 한 번에 벌크로 채운다
+        — 트리거가 있는 상태로 수십만~100만 건을 한 건씩 넣으면 매번 트리거가 도는
+        탓에 몇 분씩 걸린다(처음에 이렇게 짰다가 실측하고 알게 됨)."""
         try:
             with open(CACHE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError):
             return
-        if "files" in data or "dirs" in data:
-            self._files = data.get("files", {})
-            self._dirs = data.get("dirs", {})
-        else:
-            self._files = data  # 예전 캐시 형식(파일만 저장) 호환
 
-    def _save_cache(self):
+        files = data.get("files", data if "dirs" not in data else {})
+        dirs = data.get("dirs", {})
+
+        # 같은 물리적 파일이 서로 다른 path 문자열(구분자 표기 차이 — 예전 JSON
+        # 버전도 원본 경로 문자열을 그대로 키로 썼다)로 중복 저장돼 있을 수 있다.
+        # path_norm 기준으로 합치고, 내용이 있는 쪽을 우선한다(더 정보가 많은 쪽).
+        by_norm: Dict[str, tuple] = {}
+        for path, meta in files.items():
+            name = meta.get("name") or os.path.basename(path)
+            path_norm = meta.get("path_norm") or os.path.normcase(os.path.normpath(path))
+            content_indexed = 1 if meta.get("content_indexed") else 0
+            entries = meta.get("entries") or []
+            schema_ok = 0
+            if entries:
+                ext = os.path.splitext(path)[1].lower()
+                schema_key = "page" if ext == ".pdf" else "sheet"
+                schema_ok = 1 if schema_key in entries[0] else 0
+            existing = by_norm.get(path_norm)
+            if existing is None or (content_indexed and not existing[2]):
+                by_norm[path_norm] = (path, name, content_indexed, schema_ok,
+                                       meta.get("mtime"), meta.get("size"), entries)
+
+        file_rows = []
+        content_rows_by_norm = {}
+        for path_norm, (path, name, content_indexed, schema_ok, mtime, size, entries) in by_norm.items():
+            file_rows.append((path, path_norm, name, 0, content_indexed, schema_ok, mtime, size))
+            if content_indexed and entries:
+                content_rows_by_norm[path_norm] = entries
+
+        seen_dir_norms = set()
+        for path, meta in dirs.items():
+            name = meta.get("name") or os.path.basename(path)
+            path_norm = meta.get("path_norm") or os.path.normcase(os.path.normpath(path))
+            if path_norm in seen_dir_norms:
+                continue
+            seen_dir_norms.add(path_norm)
+            file_rows.append((path, path_norm, name, 1, 0, 0, None, None))
+
+        con = sqlite3.connect(CACHE_DB_PATH)
         try:
-            with open(CACHE_PATH, "w", encoding="utf-8") as f:
-                json.dump({"files": self._files, "dirs": self._dirs}, f, ensure_ascii=False)
+            con.execute("PRAGMA journal_mode=WAL")
+            con.executescript(BASE_SCHEMA_SQL)
+            con.executemany(
+                "INSERT INTO files (path, path_norm, name, is_dir, content_indexed, "
+                "entries_schema, mtime, size) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                file_rows,
+            )
+            if content_rows_by_norm:
+                id_by_norm = dict(con.execute("SELECT path_norm, id FROM files WHERE content_indexed = 1"))
+                content_rows = []
+                for path_norm, entries in content_rows_by_norm.items():
+                    file_id = id_by_norm.get(path_norm)
+                    if file_id is None:
+                        continue
+                    for e in entries:
+                        content_rows.append((
+                            file_id, e["location"], e["text"],
+                            e.get("page"), e.get("sheet"), e.get("row"),
+                        ))
+                con.executemany(
+                    "INSERT INTO content_entries (file_id, location, text, page, sheet, row_num) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    content_rows,
+                )
+            con.executescript(FTS_SCHEMA_SQL)
+            con.execute("INSERT INTO files_fts(rowid, name) SELECT id, name FROM files")
+            con.execute("INSERT INTO content_fts(rowid, text) SELECT id, text FROM content_entries")
+            con.commit()
+        finally:
+            con.close()
+
+        try:
+            os.replace(CACHE_PATH, CACHE_PATH + ".bak")
         except OSError:
             pass
 
@@ -72,27 +308,47 @@ class Indexer:
         매핑만 미리 만들어 두는 셈). 하위 폴더 이름도 함께 기록해 폴더명 검색에 쓴다.
         내용 검색 폴더는 기존처럼 xlsx/pdf만 파싱한다.
 
-        os.walk 대신 os.scandir 를 명시적 스택으로 직접 순회한다: os.walk 는 이미 읽어온
-        디렉터리 엔트리(FindFirstFile/FindNextFile 결과)를 파일명 문자열로만 넘겨줘서,
-        내용 검색이 필요 없는 filename_only 폴더에서도 mtime/size 비교를 위해 os.stat()을
-        다시 호출하게 되는데, 이게 전체 색인 시간의 대부분(프로파일링 기준 65%)을 차지했다.
-        DirEntry 를 직접 쓰면 그 정보가 이미 있으므로 재요청이 필요 없다. 재귀 대신 스택을
-        쓰는 이유는 아주 깊은 폴더 트리(예: node_modules류)에서 재귀 깊이 제한에 걸리지
-        않기 위해서다."""
+        os.walk 대신 os.scandir 를 명시적 스택으로 직접 순회한다: DirEntry 는 Windows에서
+        FindFirstFile/FindNextFile 결과를 이미 들고 있어 is_dir()/is_symlink()/stat() 가
+        추가 시스템 콜 없이 끝난다. 재귀 대신 스택을 쓰는 이유는 아주 깊은 폴더 트리에서
+        재귀 깊이 제한에 걸리지 않기 위해서다.
+
+        바뀐 파일만 SQLite 에 반영한다(전체 재작성 아님). 파일명만 색인하는 파일/폴더는
+        (다수, 보통 전체의 99%+) 한 트랜잭션으로 일괄 upsert 하고, 내용까지 색인하는
+        파일(소수)은 파일별로 content_entries 를 통째로 지우고 다시 넣는다 — 행/페이지
+        단위로 뭐가 바뀌었는지 대조하는 것보다 훨씬 간단하고, 애초에 파싱 자체가 그
+        파일 전체를 다시 읽는 작업이라 추가 비용도 거의 없다."""
         found_paths = set()
         found_dirs = set()
         scanned_roots = []  # 이번 호출에서 실제로 스캔을 시작한 폴더 (stale 정리 범위 제한용)
         denied_paths = []   # 접근거부 등으로 열거 자체를 못한 하위 경로 (stale 정리에서 제외)
 
         # 같은 폴더를 "파일명만"과 "내용까지" 두 가지 방식으로 각각 등록할 수 있는데
-        # (설정 화면에서 같은 경로를 두 번 추가), self._files 는 경로 하나당 항목 하나뿐이라
-        # 처리 순서에 따라 filename_only 쪽이 나중에 돌면서 방금 파싱한 내용을 빈 값으로
-        # 덮어써버릴 수 있다. 내용 모드로도 덮이는 경로 범위를 미리 알아두고, filename_only
-        # 처리에서는 그 범위를 건드리지 않는다(내용 모드 쪽이 알아서 채워 넣는다).
+        # (설정 화면에서 같은 경로를 두 번 추가), 처리 순서에 따라 filename_only 쪽이
+        # 나중에 돌면서 방금 파싱한 내용을 덮어써버릴 수 있다. 내용 모드로도 덮이는
+        # 경로 범위를 미리 알아두고, filename_only 처리에서는 그 범위를 건드리지 않는다.
         content_mode_roots = [
             os.path.normcase(os.path.normpath(f)) for f, fo in folder_modes
             if not fo and os.path.isdir(f)
         ]
+
+        # path_norm(정규화된 경로)을 키로 쓴다 — 같은 물리적 파일이라도 어느 등록
+        # 루트를 거쳐 스캔됐는지에 따라 os.scandir 가 만드는 path 문자열의 구분자
+        # 표기가 달라질 수 있어서, "이미 색인된 파일인가?"는 항상 path_norm 기준으로
+        # 판단해야 한다(안 그러면 같은 파일이 두 행으로 중복 색인된다).
+        pending: Dict[str, tuple] = {}          # path_norm -> _UPSERT_FILE_SQL 파라미터 그대로
+        content_pending: Dict[str, tuple] = {}  # path_norm -> (path, name, mtime, size, entries)
+        downgrade_norms = []  # 예전엔 내용까지 색인됐는데 이번엔 파일명만으로 바뀐 path_norm (content_entries 정리 대상)
+
+        def _queue_plain(path, path_norm, name, is_dir):
+            pending[path_norm] = (path, path_norm, name, is_dir, 0, 0, None, None)
+            with self._lock:
+                self._meta[path_norm] = (path, is_dir, 0, 0, None, None)
+
+        def _queue_content(path, path_norm, name, mtime, size, entries):
+            content_pending[path_norm] = (path, name, mtime, size, entries)
+            with self._lock:
+                self._meta[path_norm] = (path, 0, 1, 1, mtime, size)
 
         for folder, filename_only in folder_modes:
             if not os.path.isdir(folder):
@@ -124,16 +380,10 @@ class Indexer:
                     if is_dir:
                         dpath = entry.path
                         if filename_only:
-                            found_dirs.add(dpath)
-                            # "path_norm" 없는 항목은 구버전 스키마(예전엔 그냥 빈 dict) —
-                            # search() 가 매 검색마다 normpath/basename 을 다시 계산하지
-                            # 않도록 색인 시점에 한 번만 계산해서 저장해 둔다.
-                            if dpath not in self._dirs or "path_norm" not in self._dirs[dpath]:
-                                with self._lock:
-                                    self._dirs[dpath] = {
-                                        "name": entry.name,
-                                        "path_norm": os.path.normcase(os.path.normpath(dpath)),
-                                    }
+                            dpath_norm = os.path.normcase(os.path.normpath(dpath))
+                            found_dirs.add(dpath_norm)
+                            if dpath_norm not in self._meta:
+                                _queue_plain(dpath, dpath_norm, entry.name, 1)
                         try:
                             is_link = entry.is_symlink()
                         except OSError:
@@ -147,24 +397,20 @@ class Indexer:
                     if not filename_only and ext not in EXTRACTORS:
                         continue
                     path = entry.path
-                    found_paths.add(path)
+                    path_norm = os.path.normcase(os.path.normpath(path))
+                    found_paths.add(path_norm)
 
-                    cached = self._files.get(path)
-                    has_content = cached is not None and cached.get("content_indexed", True)  # 예전 캐시 호환: 키 없으면 내용 있다고 간주
+                    cached = self._meta.get(path_norm)  # (path, is_dir, content_indexed, entries_schema, mtime, size)
+                    has_content = cached is not None and cached[2] == 1
 
                     if filename_only:
-                        path_norm = os.path.normcase(os.path.normpath(path))
                         if content_mode_roots and any(_is_under(path_norm, r) for r in content_mode_roots):
                             continue  # 이 파일은 다른 등록이 내용까지 색인하므로 여기선 손대지 않는다
-                        # "path_norm" 없으면 구버전 스키마 — search() 가 매번 다시 계산하지
-                        # 않도록 이번에 한 번 채워 넣는다(파일 자체는 안 바뀌었어도 갱신).
-                        if cached is not None and not has_content and "path_norm" in cached:
-                            continue  # 이미 최신 스키마로 파일명만 색인됨 - stat 자체가 필요 없다
-                        with self._lock:
-                            self._files[path] = {
-                                "entries": [], "content_indexed": False,
-                                "name": name, "path_norm": path_norm,
-                            }
+                        if cached is not None and not has_content:
+                            continue  # 이미 파일명만으로 색인됨 - stat 자체가 필요 없다
+                        if has_content:
+                            downgrade_norms.append(path_norm)  # 내용 -> 파일명만 전환: 예전 content_entries 정리 필요
+                        _queue_plain(path, path_norm, name, 0)
                         continue
 
                     # 내용 검색 폴더: entry.stat() 은 scandir 결과에 이미 있는 걸 재사용하는
@@ -173,62 +419,84 @@ class Indexer:
                         stat = entry.stat()
                     except OSError:
                         continue
-                    old_entries = cached.get("entries") if cached else None
-                    # PDF 페이지/엑셀 시트 이동 기능이 추가되기 전에 색인된 캐시는
-                    # entry 안에 "page"/"sheet" 키가 없다. mtime/size 만 보고 "안 바뀌었으니
-                    # 재파싱 안 해도 됨"이라 판단하면, 파일이 실제로 안 바뀐 한 그 구버전
-                    # 데이터가 영원히 재사용돼서 페이지 이동이 계속 안 되는 채로 남는다 —
-                    # 새 entry에 있어야 할 키가 없으면 최신 스키마가 아니라고 보고 다시 파싱한다.
-                    schema_key = "page" if ext == ".pdf" else "sheet"
-                    has_current_schema = (not old_entries or schema_key in old_entries[0])
-                    same_stat = (cached is not None and cached.get("mtime") == stat.st_mtime
-                                 and cached.get("size") == stat.st_size)
-                    if has_content and has_current_schema and same_stat:
-                        if "path_norm" not in cached:
-                            # 내용(entries)은 이미 최신이라 다시 파싱할 필요는 없고,
-                            # search() 캐시용 name/path_norm 메타데이터만 없는 구버전이라
-                            # 그것만 채워 넣는다 — 파일을 다시 열어 파싱하면(특히 대용량
-                            # PDF/엑셀이면) 이 메타데이터 하나 채우자고 훨씬 비싼 작업을
-                            # 반복하게 된다.
-                            with self._lock:
-                                cached["name"] = name
-                                cached["path_norm"] = os.path.normcase(os.path.normpath(path))
+                    # PDF 페이지/엑셀 시트 이동 기능이 추가되기 전에 색인된 캐시는 entries_schema=0
+                    # (마이그레이션 시 표시됨). mtime/size 만 보고 "안 바뀌었으니 재파싱 안 해도
+                    # 됨"이라 판단하면 그 구버전 데이터가 영원히 재사용돼서 페이지 이동이 계속
+                    # 안 되는 채로 남는다.
+                    same_stat = cached is not None and cached[4] == stat.st_mtime and cached[5] == stat.st_size
+                    if has_content and same_stat and cached[3] == 1:
                         continue  # 변경 없고 이미 최신 스키마로 내용까지 색인됨
 
                     if progress:
                         progress(name)
                     entries = EXTRACTORS[ext](path) if ext in EXTRACTORS else []
-                    with self._lock:
-                        self._files[path] = {
-                            "mtime": stat.st_mtime,
-                            "size": stat.st_size,
-                            "entries": entries,
-                            "content_indexed": True,
-                            "name": name,
-                            "path_norm": os.path.normcase(os.path.normpath(path)),
-                        }
+                    _queue_content(path, path_norm, name, stat.st_mtime, stat.st_size, entries)
 
         # 삭제된 파일/폴더 정리: 이번에 실제로 스캔에 성공한 루트 범위 안에서만 지운다
         # (접근거부로 못 본 하위 트리는 범위에서 제외 — 못 찾은 걸 삭제된 걸로 오인하지 않게).
-        def _under_any(p: str, roots: list) -> bool:
-            pn = os.path.normcase(os.path.normpath(p))
-            return any(_is_under(pn, r) for r in roots)
+        def _under_any(p_norm: str, roots: list) -> bool:
+            return any(_is_under(p_norm, r) for r in roots)
 
         with self._lock:
-            stale = [
-                p for p in self._files
-                if p not in found_paths and _under_any(p, scanned_roots) and not _under_any(p, denied_paths)
-            ]
-            for p in stale:
-                del self._files[p]
-            stale_dirs = [
-                d for d in self._dirs
-                if d not in found_dirs and _under_any(d, scanned_roots) and not _under_any(d, denied_paths)
-            ]
-            for d in stale_dirs:
-                del self._dirs[d]
+            meta_snapshot = list(self._meta.items())  # (path_norm, (path, is_dir, content_indexed, entries_schema, mtime, size))
 
-        self._save_cache()
+        stale_files = [
+            path_norm for path_norm, (_path, is_dir, *_rest) in meta_snapshot
+            if is_dir == 0 and path_norm not in found_paths
+            and _under_any(path_norm, scanned_roots) and not _under_any(path_norm, denied_paths)
+        ]
+        stale_dirs = [
+            path_norm for path_norm, (_path, is_dir, *_rest) in meta_snapshot
+            if is_dir == 1 and path_norm not in found_dirs
+            and _under_any(path_norm, scanned_roots) and not _under_any(path_norm, denied_paths)
+        ]
+        stale = stale_files + stale_dirs
+
+        with self._lock:
+            con = _connect()
+            try:
+                if pending:
+                    con.executemany(_UPSERT_FILE_SQL, list(pending.values()))
+
+                if downgrade_norms:
+                    CHUNK = 500
+                    for i in range(0, len(downgrade_norms), CHUNK):
+                        chunk = downgrade_norms[i:i + CHUNK]
+                        placeholders = ",".join("?" * len(chunk))
+                        con.execute(
+                            f"DELETE FROM content_entries WHERE file_id IN "
+                            f"(SELECT id FROM files WHERE path_norm IN ({placeholders}))",
+                            chunk,
+                        )
+
+                for path_norm, (path, name, mtime, size, entries) in content_pending.items():
+                    cur = con.execute(
+                        _INSERT_FILE_RETURNING_ID_SQL,
+                        (path, path_norm, name, 0, 1, 1, mtime, size),
+                    )
+                    file_id = cur.fetchone()[0]
+                    con.execute("DELETE FROM content_entries WHERE file_id = ?", (file_id,))
+                    if entries:
+                        con.executemany(
+                            "INSERT INTO content_entries (file_id, location, text, page, sheet, row_num) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            [(file_id, e["location"], e["text"], e.get("page"), e.get("sheet"), e.get("row"))
+                             for e in entries],
+                        )
+
+                if stale:
+                    # SQLite 파라미터 개수 제한(기본 999)을 피하려고 묶어서 지운다.
+                    # content_entries 는 FK ON DELETE CASCADE 로 같이 정리된다.
+                    CHUNK = 500
+                    for i in range(0, len(stale), CHUNK):
+                        chunk = stale[i:i + CHUNK]
+                        placeholders = ",".join("?" * len(chunk))
+                        con.execute(f"DELETE FROM files WHERE path_norm IN ({placeholders})", chunk)
+                    for p in stale:
+                        self._meta.pop(p, None)
+                con.commit()
+            finally:
+                con.close()
 
     # ---------- 검색 ----------
     def search(self, query: str, limit: int = MAX_RESULTS,
@@ -238,24 +506,24 @@ class Indexer:
         폴더별로 내용 검색/파일명만 검색을 다르게 지정할 수 있다.
         None 이면 폴더 제한 없이 전체를 내용 검색한다.
         검색어에 공백으로 여러 단어를 넣으면 전부 포함하는 것만 찾는다(순서/인접 무관) —
-        이미 검색한 결과에 단어를 더 입력해서 계속 좁혀나갈 수 있다(결과 안에서 추가 검색)."""
+        이미 검색한 결과에 단어를 더 입력해서 계속 좁혀나갈 수 있다(결과 안에서 추가 검색).
+
+        파일명/폴더명/내용 전부 SQLite 인덱스로 후보를 찾고(느린 Python 전체 스캔이
+        아니라), 폴더 범위 판단(같은 경로가 파일명만/내용까지 두 가지로 등록됐을 수
+        있어 후보 하나가 여러 폴더에 걸릴 수 있다)만 그 소수의 후보에 대해 Python 에서
+        처리한다."""
         query = query.strip()
         if not query:
             return []
         terms = [t for t in query.lower().split() if t]
         if not terms:
             return []
-        q_lower = terms[0]  # 스니펫 위치는 첫 검색어 기준으로 잡는다
         results = []
-        with self._lock:
-            items = list(self._files.items())
-            dir_items = list(self._dirs.items())
 
         allowed_norm = None
         if folder_modes is not None:
-            # (루트, 접두사, filename_only) — 접두사(끝에 구분자 붙인 버전)를 여기서 폴더
-            # 개수만큼만 미리 만들어 둔다. _is_under 안에서 매번 만들면 파일 수만큼(수십만
-            # 번) 문자열을 새로 이어붙이게 되는데, 정작 그 값은 루트별로 고정이라 낭비다.
+            # (루트, 접두사, filename_only) — 접두사(끝에 구분자 붙인 버전)를 폴더
+            # 개수만큼만 미리 만들어 둔다.
             allowed_norm = []
             for f, fo in folder_modes:
                 root_norm = os.path.normcase(os.path.normpath(f))
@@ -264,72 +532,84 @@ class Indexer:
 
         def _matched_folders(p_norm: str):
             """p_norm 이 속하는 모든 (폴더_norm, filename_only) 를 반환한다(여러 개 가능 —
-            같은 경로를 파일명만/내용까지 두 가지로 각각 등록했을 수 있다). 예전엔 첫
-            매치 하나만 채택했는데, 그러면 둘 다 등록된 파일은 먼저 나온 등록의 모드로만
-            취급돼서 다른 쪽 모드의 검색 결과가 아예 안 나오는 문제가 있었다."""
+            같은 경로를 파일명만/내용까지 두 가지로 각각 등록했을 수 있다). 첫 매치 하나만
+            채택하면, 둘 다 등록된 파일은 먼저 나온 등록의 모드로만 취급돼서 다른 쪽 모드의
+            검색 결과가 아예 안 나오는 문제가 있다."""
             if allowed_norm is None:
                 return [("", False)]  # 폴더 제한 없음 = 내용 검색으로 취급
             return [(root_norm, fo) for root_norm, prefix, fo in allowed_norm
                     if p_norm == root_norm or p_norm.startswith(prefix)]
 
-        # ---- 폴더명 매칭: filename_only 폴더에서만, 폴더 자체를 결과로 보여준다 ----
-        for dpath, ddata in dir_items:
-            # 색인 시점에 계산해 둔 값 사용 — 구버전 캐시(값이 그냥 {})라 없으면 그때만 계산
-            dpath_norm = ddata.get("path_norm") or os.path.normcase(os.path.normpath(dpath))
-            matches = _matched_folders(dpath_norm)
-            if not any(fo for _, fo in matches):
-                continue
-            name = ddata.get("name") or os.path.basename(dpath)
-            name_lower = name.lower()
-            if all(t in name_lower for t in terms):
-                results.append({
-                    "path": dpath,
-                    "name": name,
-                    "location": "폴더명 일치",
-                    "snippet": "",
-                    "is_dir": True,
-                })
-                if len(results) >= limit:
-                    return results
+        con = _connect()
+        try:
+            # ---- 폴더명 매칭: filename_only 폴더에서만, 폴더 자체를 결과로 보여준다 ----
+            dir_rows = _term_search_sql(
+                "files", "name", "files_fts", "t.path, t.path_norm, t.name",
+                con, terms, extra_where="t.is_dir = 1",
+            )
+            for path, path_norm, name in dir_rows:
+                matches = _matched_folders(path_norm)
+                if not any(fo for _, fo in matches):
+                    continue
+                name_lower = name.lower()
+                if all(t in name_lower for t in terms):
+                    results.append({
+                        "path": path,
+                        "name": name,
+                        "location": "폴더명 일치",
+                        "snippet": "",
+                        "is_dir": True,
+                    })
+                    if len(results) >= limit:
+                        return results
 
-        # ---- 파일 매칭 ----
-        for path, data in items:
-            path_norm = data.get("path_norm") or os.path.normcase(os.path.normpath(path))
+            # ---- 파일명 후보 ----
+            name_rows = _term_search_sql(
+                "files", "name", "files_fts", "t.path, t.path_norm, t.name",
+                con, terms, extra_where="t.is_dir = 0",
+            )
+            name_hits = {path: (path_norm, name) for path, path_norm, name in name_rows}
+
+            # ---- 내용 후보 (page/sheet/row 컬럼이 실제 SQL 컬럼이라 인덱스를 탄다) ----
+            content_rows = _content_search_sql(con, terms)
+        finally:
+            con.close()
+
+        content_by_path: Dict[str, list] = {}
+        for path, path_norm, name, location, text, page, sheet, row_num in content_rows:
+            text_lower = text.lower()
+            if not all(t in text_lower for t in terms):
+                continue  # FTS 후보에는 들어왔지만 실제로 전부 포함은 아닐 수 있어 다시 확인
+            idx = text_lower.find(terms[0])
+            start = max(0, idx - SNIPPET_RADIUS)
+            end = min(len(text), idx + len(terms[0]) + SNIPPET_RADIUS, start + MAX_SNIPPET_LEN)
+            snippet = text[start:end]
+            if start > 0:
+                snippet = "…" + snippet
+            if end < len(text):
+                snippet = snippet + "…"
+            result = {"path": path, "name": name, "location": location, "snippet": snippet}
+            if sheet is not None:
+                result["sheet"] = sheet
+                result["row"] = row_num
+            if page is not None:
+                result["page"] = page
+            content_by_path.setdefault(path, []).append((path_norm, result))
+
+        # ---- 파일별로 통합: 폴더 범위 판단 + 파일명/내용 우선순위 ----
+        all_paths = set(name_hits) | set(content_by_path)
+        for path in all_paths:
+            if path in content_by_path:
+                path_norm = content_by_path[path][0][0]
+            else:
+                path_norm = name_hits[path][0]
             matches = _matched_folders(path_norm)
             if not matches:
                 continue
             wants_filename = any(fo for _, fo in matches)
             wants_content = any(not fo for _, fo in matches)
 
-            content_hits = []
-            if wants_content:
-                for entry in data.get("entries", []):
-                    text = entry["text"]
-                    text_lower = text.lower()
-                    if not all(t in text_lower for t in terms):
-                        continue
-                    idx = text_lower.find(q_lower)
-                    start = max(0, idx - SNIPPET_RADIUS)
-                    end = min(len(text), idx + len(q_lower) + SNIPPET_RADIUS, start + MAX_SNIPPET_LEN)
-                    snippet = text[start:end]
-                    if start > 0:
-                        snippet = "…" + snippet
-                    if end < len(text):
-                        snippet = snippet + "…"
-                    result = {
-                        "path": path,
-                        "name": data.get("name") or os.path.basename(path),
-                        "location": entry["location"],
-                        "snippet": snippet,
-                    }
-                    # 더블클릭 시 파일을 열면서 검색된 위치(엑셀 시트/행, PDF 페이지)로
-                    # 바로 이동할 수 있도록, 있으면 같이 넘긴다.
-                    if "sheet" in entry:
-                        result["sheet"] = entry["sheet"]
-                        result["row"] = entry["row"]
-                    if "page" in entry:
-                        result["page"] = entry["page"]
-                    content_hits.append(result)
+            content_hits = [r for _, r in content_by_path.get(path, [])] if wants_content else []
 
             if content_hits:
                 # 같은 파일이 파일명 등록과 내용 등록 둘 다에 걸리면("폴더 두 번 추가")
@@ -340,8 +620,8 @@ class Indexer:
                     results.append(result)
                     if len(results) >= limit:
                         return results
-            elif wants_filename:
-                name = data.get("name") or os.path.basename(path)
+            elif wants_filename and path in name_hits:
+                name = name_hits[path][1]
                 name_lower = name.lower()
                 if all(t in name_lower for t in terms):
                     results.append({
@@ -357,4 +637,4 @@ class Indexer:
 
     def file_count(self) -> int:
         with self._lock:
-            return len(self._files)
+            return sum(1 for _path, is_dir, *_rest in self._meta.values() if is_dir == 0)
