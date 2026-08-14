@@ -506,6 +506,49 @@ class SearchLineEdit(QLineEdit):
         return self.text()[:pos] + self._preedit + self.text()[pos:]
 
 
+class SpinningToolButton(QToolButton):
+    """색인 진행 중임을 "N개 확인 중…" 같은 텍스트 대신 아이콘 자체를 돌려서
+    보여준다 — 옵션 버튼(⚙)이 톱니바퀴 모양이라 회전 자체가 "돌아가고 있다"는
+    은유와 잘 맞는다. 클릭 동작(옵션 열기)은 그대로 유지된다."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
+    def start_spin(self):
+        if not self._timer.isActive():
+            self._timer.start(40)  # 초당 25프레임 정도 - 부드러우면서 CPU 부담 적음
+
+    def stop_spin(self):
+        self._timer.stop()
+        if self._angle != 0:
+            self._angle = 0
+            self.update()
+
+    def _tick(self):
+        self._angle = (self._angle + 12) % 360
+        self.update()
+
+    def paintEvent(self, event):
+        if self._angle == 0:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        center = self.rect().center()
+        painter.translate(center)
+        painter.rotate(self._angle)
+        painter.translate(-center)
+        # 스타일시트 색(#settingsBtn { color: #9aa0a6 })을 그대로 맞춰서 그린다 —
+        # 회전 중에는 QStyle 이 아니라 직접 그려야 해서 팔레트에 의존하지 않는다.
+        painter.setFont(self.font())
+        painter.setPen(QColor("#9aa0a6"))
+        painter.drawText(self.rect(), Qt.AlignCenter, self.text())
+        painter.end()
+
+
 class SearchWindow(QWidget):
     open_settings_requested = Signal()
 
@@ -519,7 +562,6 @@ class SearchWindow(QWidget):
         self._last_query = None
         self._search_worker = None
         self._indexing = False
-        self._index_status_text = ""
         self._truncated = False
         self._folder_row_shown = False
         self._folder_chip_specs = []
@@ -617,7 +659,7 @@ class SearchWindow(QWidget):
         self.loading_label.setVisible(False)
         row_layout.addWidget(self.loading_label)
 
-        self.settings_btn = QToolButton(input_row)
+        self.settings_btn = SpinningToolButton(input_row)
         self.settings_btn.setObjectName("settingsBtn")
         self.settings_btn.setText("⚙")
         self.settings_btn.clicked.connect(self.open_settings_requested.emit)
@@ -1100,14 +1142,10 @@ class SearchWindow(QWidget):
         self._render_results()
 
     def _refresh_status_label(self):
-        """검색 중/색인 중 상태에 따라 loading_label 을 갱신한다. 검색이 더 급한
-        피드백이라 우선순위를 높게 둔다 — 색인 중이어도 검색은 별도 스레드라
-        동시에 돌 수 있다."""
+        """검색 중일 때만 loading_label 을 쓴다 — 색인 중임은 옵션 버튼(⚙) 회전으로
+        따로 보여주므로 여기서 다룰 필요가 없다."""
         if self._search_worker is not None and self._search_worker.isRunning():
             self.loading_label.setText("검색 중…")
-            self.loading_label.setVisible(True)
-        elif self._indexing:
-            self.loading_label.setText(self._index_status_text)
             self.loading_label.setVisible(True)
         else:
             self.loading_label.setVisible(False)
@@ -1115,16 +1153,19 @@ class SearchWindow(QWidget):
     # ---------- 색인 진행 상황 (main.App 이 IndexWorker 시그널을 여기로 연결) ----------
     def on_index_started(self):
         self._indexing = True
-        self._index_status_text = "색인 중…"
-        self._refresh_status_label()
+        self.settings_btn.setToolTip("색인 중…")
+        self.settings_btn.start_spin()
 
     def on_index_progress(self, text: str):
-        self._index_status_text = text
-        self._refresh_status_label()
+        # "N개 확인 중…" 같은 텍스트를 화면에 따로 띄우는 대신, 옵션 버튼(⚙)을
+        # 돌리는 것만으로 "지금 뭔가 하고 있다"를 보여준다 — 정확한 진행 수치가
+        # 궁금하면 마우스를 올렸을 때 툴팁으로 볼 수 있게만 남겨둔다.
+        self.settings_btn.setToolTip(text)
 
     def on_index_finished(self, _count: int):
         self._indexing = False
-        self._refresh_status_label()
+        self.settings_btn.stop_spin()
+        self.settings_btn.setToolTip("")
         # 지금 보고 있는 검색 결과가 방금 끝난 재색인으로 바뀌었을 수 있다 — 화면을
         # 조용히 덮어써버리면(스크롤 위치·선택 항목이 날아감) 당황스러우니, 직접
         # 눌러야 갱신되는 배너로만 알려준다.
