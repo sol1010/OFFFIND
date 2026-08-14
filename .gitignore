@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+build/
+dist/
+installer_output/
+*.spec
+
+# 개인 테스트/업무용 폴더 - 공개 저장소에 올리면 안 되는 실제 파일이 들어있음
+검색자료/
