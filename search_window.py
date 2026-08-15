@@ -4,7 +4,7 @@
 """
 import os
 
-from PySide6.QtCore import Qt, QTimer, Signal, QEvent, QPoint, QPointF, QRect, QSize, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QTimer, Signal, QEvent, QPoint, QPointF, QRect, QRectF, QSize, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import (
     QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QKeySequence, QPainter,
     QShortcut, QTextCharFormat, QTextLayout,
@@ -542,15 +542,24 @@ class SpinningToolButton(QToolButton):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        center = self.rect().center()
-        painter.translate(center)
-        painter.rotate(self._angle)
-        painter.translate(-center)
         # 스타일시트 색(#settingsBtn { color: #9aa0a6 })을 그대로 맞춰서 그린다 —
         # 회전 중에는 QStyle 이 아니라 직접 그려야 해서 팔레트에 의존하지 않는다.
         painter.setFont(self.font())
         painter.setPen(QColor("#9aa0a6"))
-        painter.drawText(self.rect(), Qt.AlignCenter, self.text())
+
+        text = self.text()
+        # Qt.AlignCenter 로 버튼 rect 안에서 중앙 정렬하면, 폰트의 일반적인
+        # ascent/descent 기준으로 중앙을 잡는다 — ⚙ 같은 기호 글리프는 그 기준과
+        # 실제 보이는 모양의 중심이 미묘하게 달라서, 회전축(버튼 중심)과 글자의
+        # 시각적 중심이 어긋나 제자리에서 안 돌고 살짝 겉돌아(공전하듯) 보였다.
+        # fontMetrics().boundingRect() 로 이 글자의 실제 픽셀 경계를 구해서, 그
+        # 경계 자체를 회전축에 맞춘 뒤 회전시킨다.
+        bounds = painter.fontMetrics().boundingRect(text)
+        center = self.rect().center()
+        painter.translate(center)
+        painter.rotate(self._angle)
+        target = QRectF(-bounds.width() / 2, -bounds.height() / 2, bounds.width(), bounds.height())
+        painter.drawText(target, Qt.AlignCenter, text)
         painter.end()
 
 
