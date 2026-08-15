@@ -514,25 +514,30 @@ class SpinningToolButton(QToolButton):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._angle = 0
+        self._spinning = False  # 각도(_angle)와 별개로 관리 — 안 그러면 한 바퀴 돌
+        # 때마다(각도가 360 -> 0 으로 넘어갈 때) 아래 "회전 안 함" 분기를 잠깐
+        # 타면서 그 프레임만 기본 스타일로 그려져 위치가 살짝 튀어(흔들려) 보였다.
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
     def start_spin(self):
         if not self._timer.isActive():
-            self._timer.start(40)  # 초당 25프레임 정도 - 부드러우면서 CPU 부담 적음
+            self._spinning = True
+            self._timer.start(50)  # 초당 20프레임
 
     def stop_spin(self):
         self._timer.stop()
+        self._spinning = False
         if self._angle != 0:
             self._angle = 0
             self.update()
 
     def _tick(self):
-        self._angle = (self._angle + 12) % 360
+        self._angle = (self._angle + 6) % 360  # 한 바퀴에 ~3초 (예전보다 느리게)
         self.update()
 
     def paintEvent(self, event):
-        if self._angle == 0:
+        if not self._spinning:
             super().paintEvent(event)
             return
         painter = QPainter(self)
