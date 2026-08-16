@@ -2,7 +2,7 @@
 ; Inno Setup(ISCC.exe)으로 컴파일한다. 관리자 권한이 필요 없도록 사용자 폴더(AppData\Local)에
 ; 설치한다 — 어차피 자동 시작 등록도 HKCU 레지스트리라 관리자 권한 자체가 필요 없다.
 #define MyAppName "OFFFIND"
-#define MyAppVersion "1.1"
+#define MyAppVersion "1.2"
 #define MyAppExeName "OFFFIND.exe"
 
 [Setup]

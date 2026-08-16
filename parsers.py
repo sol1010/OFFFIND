@@ -4,6 +4,19 @@
 from typing import List, Dict, Any
 
 
+class ParseFailed(Exception):
+    """파일을 아예 열지 못했다(손상·잠김·지원 안 되는 변형 등).
+
+    "열긴 했는데 글자가 없다"(예: 스캔 이미지만 있는 PDF, 빈 문서)와 반드시
+    구분해야 해서 예외로 올린다. 예전엔 둘 다 빈 리스트를 돌려줘서 호출자
+    (indexer)가 구분할 수 없었고, 그래서 색인 순간에 잠깐 열려 있던 파일이
+    "내용 없는 파일"로 굳어 영원히 검색에서 빠졌다.
+
+    반대로 파일은 열렸는데 시트/페이지 하나에서만 실패한 경우는 예외로 올리지
+    않는다 — 그때까지 뽑은 내용은 쓸모가 있고, 다시 시도해도 어차피 같은
+    지점에서 또 실패하기 때문이다."""
+
+
 def extract_xlsx(path: str) -> List[Dict[str, Any]]:
     """시트별 각 행을 하나의 검색 entry로 반환."""
     import openpyxl
@@ -11,8 +24,8 @@ def extract_xlsx(path: str) -> List[Dict[str, Any]]:
     entries = []
     try:
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    except Exception:
-        return entries
+    except Exception as e:
+        raise ParseFailed(f"xlsx 열기 실패: {path}") from e
 
     try:
         # docx/pptx 추출기와 마찬가지로, 시트/행 하나에서 예상 못한 예외가 나도
@@ -46,7 +59,13 @@ def extract_pdf(path: str) -> List[Dict[str, Any]]:
 
     entries = []
     try:
-        with pdfplumber.open(path) as pdf:
+        pdf = pdfplumber.open(path)
+    except Exception as e:
+        raise ParseFailed(f"pdf 열기 실패: {path}") from e
+
+    # 열린 뒤 페이지 하나에서 나는 실패는 그때까지 뽑은 것을 살린다(ParseFailed 참고).
+    try:
+        try:
             for i, page in enumerate(pdf.pages, start=1):
                 text = page.extract_text() or ""
                 text = " ".join(text.split())
@@ -57,8 +76,10 @@ def extract_pdf(path: str) -> List[Dict[str, Any]]:
                     "text": text,
                     "page": i,
                 })
-    except Exception:
-        return entries
+        except Exception:
+            pass
+    finally:
+        pdf.close()
     return entries
 
 
@@ -69,8 +90,8 @@ def extract_docx(path: str) -> List[Dict[str, Any]]:
     entries = []
     try:
         doc = docx.Document(path)
-    except Exception:
-        return entries
+    except Exception as e:
+        raise ParseFailed(f"docx 열기 실패: {path}") from e
 
     # 개별 문단/표에서 예상 못한 예외(문서마다 구조가 미묘하게 다를 수 있다)가
     # 나도 전체 파일을 통째로 포기하지 않고, 그때까지 뽑은 entries 는 그대로
@@ -112,8 +133,8 @@ def extract_pptx(path: str) -> List[Dict[str, Any]]:
     entries = []
     try:
         prs = pptx.Presentation(path)
-    except Exception:
-        return entries
+    except Exception as e:
+        raise ParseFailed(f"pptx 열기 실패: {path}") from e
 
     # 슬라이드 하나에서 예상 못한 예외가 나도 전체 파일을 포기하지 않는다 —
     # 실제로 "노트 슬라이드는 있는데(has_notes_slide=True) 그 안에 노트

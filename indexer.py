@@ -35,7 +35,11 @@ CREATE TABLE IF NOT EXISTS files (
     content_indexed INTEGER NOT NULL DEFAULT 0,
     entries_schema INTEGER NOT NULL DEFAULT 0,
     mtime REAL,
-    size INTEGER
+    size INTEGER,
+    -- 내용 파싱이 실패한 마지막 시각(unix time). NULL 이면 실패한 적 없음.
+    -- 실패를 "내용이 없는 파일"과 구분하기 위한 것 — 자세한 이유는
+    -- PARSE_RETRY_AFTER_SEC 주석 참고.
+    parse_failed_at REAL
 );
 -- 동일성 판단은 항상 path_norm(정규화된 경로) 기준이어야 한다: 같은 물리적 파일도
 -- 어느 등록 루트를 거쳐 스캔됐는지에 따라 os.scandir 가 만드는 path 문자열의
@@ -62,16 +66,29 @@ CREATE INDEX IF NOT EXISTS idx_content_entries_file_id ON content_entries(file_i
 """
 
 _CONTENT_ENTRIES_EXTRA_COLUMNS = {"paragraph": "INTEGER", "slide": "INTEGER"}
+_FILES_EXTRA_COLUMNS = {"parse_failed_at": "REAL"}
+
+# 내용 파싱에 실패한 파일을 다시 시도하기까지 기다리는 시간.
+# 실패를 그냥 "내용 0개"로 저장해두면(예전 동작) mtime/size 가 그대로인 한 영원히
+# 재시도하지 않아서, 잠깐 열려 있었다는 이유만으로 그 파일이 검색에서 영구히
+# 빠졌다. 반대로 매번 재시도하면 정말 깨진 큰 PDF 를 색인 때마다 다시 파싱하게
+# 된다 — 그래서 "파일이 바뀌면 즉시, 안 바뀌었으면 이 시간 뒤에" 재시도한다.
+PARSE_RETRY_AFTER_SEC = 6 * 60 * 60
 
 
 def _ensure_content_columns(con: sqlite3.Connection):
-    """Word/PowerPoint 지원을 나중에 추가하면서 content_entries 에 paragraph/slide
-    컬럼이 새로 생겼는데, CREATE TABLE IF NOT EXISTS 는 이미 만들어진(예전 버전이
-    만든) 테이블엔 새 컬럼을 안 붙여준다 — 있는지 확인해서 없으면 그때 추가한다."""
+    """나중에 추가된 컬럼들을 기존 DB 에도 붙인다. CREATE TABLE IF NOT EXISTS 는
+    이미 만들어진(예전 버전이 만든) 테이블엔 새 컬럼을 안 붙여주기 때문이다.
+    content_entries 는 Word/PowerPoint 지원 때 paragraph/slide 가,
+    files 는 파싱 실패 재시도를 위해 parse_failed_at 이 나중에 생겼다."""
     cols = {row[1] for row in con.execute("PRAGMA table_info(content_entries)")}
     for col, coltype in _CONTENT_ENTRIES_EXTRA_COLUMNS.items():
         if col not in cols:
             con.execute(f"ALTER TABLE content_entries ADD COLUMN {col} {coltype}")
+    cols = {row[1] for row in con.execute("PRAGMA table_info(files)")}
+    for col, coltype in _FILES_EXTRA_COLUMNS.items():
+        if col not in cols:
+            con.execute(f"ALTER TABLE files ADD COLUMN {col} {coltype}")
 
 FTS_SCHEMA_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
@@ -102,12 +119,13 @@ END;
 SCHEMA_SQL = BASE_SCHEMA_SQL + FTS_SCHEMA_SQL
 
 _UPSERT_FILE_SQL = """
-INSERT INTO files (path, path_norm, name, is_dir, content_indexed, entries_schema, mtime, size)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO files (path, path_norm, name, is_dir, content_indexed, entries_schema, mtime, size,
+                    parse_failed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(path_norm) DO UPDATE SET
     path=excluded.path, name=excluded.name, is_dir=excluded.is_dir,
     content_indexed=excluded.content_indexed, entries_schema=excluded.entries_schema,
-    mtime=excluded.mtime, size=excluded.size
+    mtime=excluded.mtime, size=excluded.size, parse_failed_at=excluded.parse_failed_at
 """
 
 
@@ -130,6 +148,32 @@ def _connect() -> sqlite3.Connection:
     con.execute("PRAGMA journal_mode=WAL")  # 백그라운드 색인(쓰기)과 검색(읽기)이 서로 안 막게
     con.execute("PRAGMA foreign_keys=ON")   # 파일 삭제 시 content_entries 도 같이 지워지게(CASCADE)
     return con
+
+
+def _scope_where(roots_norm: List[str], col: str):
+    """검색 범위를 등록된 폴더 안으로 제한하는 WHERE 조각과 파라미터를 만든다.
+    빈 목록이면 ("", []) — 호출부에서 조건을 아예 붙이지 않는다.
+
+    이 조건이 반드시 SQL 쪽에 있어야 한다. 예전엔 범위 판단을 전부 Python 에서
+    했는데, 그러면 LIMIT 이 범위와 무관하게 먼저 걸려서 "실제로는 결과가 있는데
+    검색 결과 없음"이 나올 수 있었다 — 늦게 색인돼 rowid 가 큰 폴더일수록 심해서,
+    실측으로 C:\\Program Files 안의 2,811건이 통째로 0건이 되는 걸 확인했다
+    (앞쪽 40,000건이 전부 다른 폴더로 채워지고 그 뒤 Python 필터에서 전멸).
+
+    LIKE 'prefix%' 대신 범위 비교(>=, <)를 쓴다 — 윈도우 경로에는 '_'(LIKE 의 한
+    글자 와일드카드)가 흔해서 LIKE 는 엉뚱한 경로까지 걸리고, 이스케이프를 붙이면
+    path_norm 인덱스를 못 탄다. 범위 비교는 인덱스를 그대로 탄다."""
+    if not roots_norm:
+        return "", []
+    parts, params = [], []
+    for root in roots_norm:
+        prefix = root if root.endswith(os.sep) else root + os.sep
+        # prefix 로 시작하는 모든 문자열은 [prefix, prefix의 마지막 글자를 하나
+        # 올린 값) 범위 안에 들어온다. 루트 자기 자신(prefix 없는 형태)도 포함.
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+        parts.append(f"({col} = ? OR ({col} >= ? AND {col} < ?))")
+        params.extend([root, prefix, upper])
+    return "(" + " OR ".join(parts) + ")", params
 
 
 def _term_search_sql(table: str, text_col: str, fts_table: str, select_cols: str,
@@ -170,14 +214,20 @@ def _term_search_sql(table: str, text_col: str, fts_table: str, select_cols: str
     ).fetchall()
 
 
-def _content_search_sql(con: sqlite3.Connection, terms: List[str], sql_limit: int = 3000):
+def _content_search_sql(con: sqlite3.Connection, terms: List[str], sql_limit: int = 3000,
+                         scope_roots: Optional[List[str]] = None):
     """terms 전부가 내용 텍스트에 부분일치하는 (path, path_norm, name, location, text,
     page, sheet, row_num, paragraph, slide) 행을 반환한다. content_entries 는 files 와
     별도 테이블이라 files 를 조인해야 하므로 _term_search_sql 의 단일 테이블 가정을
     그대로 못 쓴다. sql_limit 이유는 _term_search_sql 문서 참고 — content_entries는
-    행 하나하나가 문장 전체라 LIKE 스캔 비용이 더 크다."""
+    행 하나하나가 문장 전체라 LIKE 스캔 비용이 더 크다.
+
+    scope_roots 가 주어지면 그 폴더들 안으로 먼저 좁힌 뒤 LIMIT 을 건다
+    (_scope_where 문서 참고 — 안 그러면 결과가 통째로 누락될 수 있다)."""
     select_cols = ("f.path, f.path_norm, f.name, ce.location, ce.text, "
                    "ce.page, ce.sheet, ce.row_num, ce.paragraph, ce.slide")
+    scope_sql, scope_params = _scope_where(scope_roots or [], "f.path_norm")
+    scope_and = f" AND {scope_sql}" if scope_sql else ""
     if all(len(t) >= 3 for t in terms):
         match_expr = " ".join('"' + t.replace('"', '""') + '"' for t in terms)
         try:
@@ -187,10 +237,10 @@ def _content_search_sql(con: sqlite3.Connection, terms: List[str], sql_limit: in
                 FROM content_fts
                 JOIN content_entries ce ON ce.id = content_fts.rowid
                 JOIN files f ON f.id = ce.file_id
-                WHERE content_fts MATCH ?
+                WHERE content_fts MATCH ?{scope_and}
                 LIMIT ?
                 """,
-                (match_expr, sql_limit),
+                (match_expr, *scope_params, sql_limit),
             ).fetchall()
         except sqlite3.OperationalError:
             pass  # 검색어에 FTS5 구문을 깨는 문자가 있으면 LIKE 로 안전하게 폴백
@@ -200,20 +250,21 @@ def _content_search_sql(con: sqlite3.Connection, terms: List[str], sql_limit: in
         f"""
         SELECT {select_cols}
         FROM content_entries ce JOIN files f ON f.id = ce.file_id
-        WHERE {conds}
+        WHERE {conds}{scope_and}
         LIMIT ?
         """,
-        [*params, sql_limit],
+        [*params, *scope_params, sql_limit],
     ).fetchall()
 
 
 _INSERT_FILE_RETURNING_ID_SQL = """
-INSERT INTO files (path, path_norm, name, is_dir, content_indexed, entries_schema, mtime, size)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO files (path, path_norm, name, is_dir, content_indexed, entries_schema, mtime, size,
+                    parse_failed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(path_norm) DO UPDATE SET
     path=excluded.path, name=excluded.name, is_dir=excluded.is_dir,
     content_indexed=excluded.content_indexed, entries_schema=excluded.entries_schema,
-    mtime=excluded.mtime, size=excluded.size
+    mtime=excluded.mtime, size=excluded.size, parse_failed_at=excluded.parse_failed_at
 RETURNING id
 """
 
@@ -236,10 +287,13 @@ class Indexer:
             # 따라 다른 구분자 표기의 path 문자열로 발견될 수 있어서, "이미 색인된
             # 파일인가?"는 항상 path_norm 기준으로 판단해야 한다.
             self._meta: Dict[str, tuple] = {}
-            for path, path_norm, is_dir, content_indexed, entries_schema, mtime, size in con.execute(
-                "SELECT path, path_norm, is_dir, content_indexed, entries_schema, mtime, size FROM files"
+            for (path, path_norm, is_dir, content_indexed, entries_schema, mtime, size,
+                 parse_failed_at) in con.execute(
+                "SELECT path, path_norm, is_dir, content_indexed, entries_schema, mtime, size, "
+                "parse_failed_at FROM files"
             ):
-                self._meta[path_norm] = (path, is_dir, content_indexed, entries_schema, mtime, size)
+                self._meta[path_norm] = (path, is_dir, content_indexed, entries_schema, mtime, size,
+                                          parse_failed_at)
         finally:
             con.close()
 
@@ -356,6 +410,8 @@ class Indexer:
         found_paths = set()
         found_dirs = set()
         scanned_roots = []  # 이번 호출에서 실제로 스캔을 시작한 폴더 (stale 정리 범위 제한용)
+        scanned_roots_all = []      # 그중 파일명 패스로 훑은 루트 — 폴더와 모든 파일을 다 본다
+        scanned_roots_content = []  # 내용 패스로만 훑은 루트 — 문서 확장자 파일만 본다
         denied_paths = []   # 접근거부 등으로 열거 자체를 못한 하위 경로 (stale 정리에서 제외)
         changed = [False]  # 새 파일/변경/삭제가 하나라도 있었는지 — "색인 갱신됨" 배너 표시 여부에 씀
 
@@ -429,10 +485,10 @@ class Indexer:
                                 chunk,
                             )
 
-                    for path_norm, (path, name, mtime, size, entries) in content_pending.items():
+                    for path_norm, (path, name, mtime, size, entries, failed_at) in content_pending.items():
                         cur = con.execute(
                             _INSERT_FILE_RETURNING_ID_SQL,
-                            (path, path_norm, name, 0, 1, 1, mtime, size),
+                            (path, path_norm, name, 0, 1, 1, mtime, size, failed_at),
                         )
                         file_id = cur.fetchone()[0]
                         con.execute("DELETE FROM content_entries WHERE file_id = ?", (file_id,))
@@ -456,16 +512,18 @@ class Indexer:
                 _flush()
 
         def _queue_plain(path, path_norm, name, is_dir):
-            pending[path_norm] = (path, path_norm, name, is_dir, 0, 0, None, None)
+            pending[path_norm] = (path, path_norm, name, is_dir, 0, 0, None, None, None)
             with self._lock:
-                self._meta[path_norm] = (path, is_dir, 0, 0, None, None)
+                self._meta[path_norm] = (path, is_dir, 0, 0, None, None, None)
             changed[0] = True
             _maybe_flush()
 
-        def _queue_content(path, path_norm, name, mtime, size, entries):
-            content_pending[path_norm] = (path, name, mtime, size, entries)
+        def _queue_content(path, path_norm, name, mtime, size, entries, failed_at=None):
+            """failed_at 이 있으면 이번 파싱이 실패했다는 뜻 — 파일 자체는 파일명
+            검색이 되도록 색인하되, 실패 시각을 남겨 나중에 다시 시도하게 한다."""
+            content_pending[path_norm] = (path, name, mtime, size, entries, failed_at)
             with self._lock:
-                self._meta[path_norm] = (path, 0, 1, 1, mtime, size)
+                self._meta[path_norm] = (path, 0, 1, 1, mtime, size, failed_at)
             changed[0] = True
             _maybe_flush()
 
@@ -482,6 +540,14 @@ class Indexer:
                 continue
             folder_norm = os.path.normcase(os.path.normpath(folder))
             scanned_roots.append(folder_norm)
+
+            # stale 정리 범위는 "이번에 어떤 눈으로 훑었는지"에 맞춰야 한다.
+            # 파일명 패스는 폴더와 모든 파일을 다 보지만, 내용 패스는 문서 확장자만
+            # 보고 폴더는 아예 기록하지 않는다 — 그래서 두 범위를 따로 모은다.
+            if filename_only:
+                scanned_roots_all.append(folder_norm)
+            else:
+                scanned_roots_content.append(folder_norm)
 
             exact_key = (folder_norm, bool(filename_only))
             if exact_key in seen_exact_modes:
@@ -569,7 +635,13 @@ class Indexer:
                     has_content = cached is not None and cached[2] == 1
 
                     if filename_only:
-                        if content_mode_roots and any(_is_under(path_norm, r) for r in content_mode_roots):
+                        # 내용 등록이 실제로 다룰 파일(문서 확장자)만 비켜준다.
+                        # 예전엔 확장자를 안 보고 내용 폴더 아래 파일을 전부
+                        # 건너뛰어서, 그 폴더의 txt/jpg 같은 파일은 내용 패스도
+                        # 안 보고 파일명 패스도 안 봐서 아예 색인이 안 됐다 —
+                        # 파일명 칩으로도 영원히 못 찾는 상태가 된다(테스트로 발견).
+                        if (content_mode_roots and ext in EXTRACTORS
+                                and any(_is_under(path_norm, r) for r in content_mode_roots)):
                             continue  # 이 파일은 다른 등록이 내용까지 색인하므로 여기선 손대지 않는다
                         if cached is not None and not has_content:
                             continue  # 이미 파일명만으로 색인됨 - stat 자체가 필요 없다
@@ -590,7 +662,13 @@ class Indexer:
                     # 안 되는 채로 남는다.
                     same_stat = cached is not None and cached[4] == stat.st_mtime and cached[5] == stat.st_size
                     if has_content and same_stat and cached[3] == 1:
-                        continue  # 변경 없고 이미 최신 스키마로 내용까지 색인됨
+                        # 지난번에 파싱이 실패했던 파일이면, 파일이 그대로여도 일정
+                        # 시간이 지났으면 한 번 더 시도한다 — 잠깐 열려 있었거나
+                        # 일시적인 오류였을 수 있는데, 예전엔 그런 파일이 "내용 없는
+                        # 파일"로 굳어 영원히 검색에서 빠졌다.
+                        failed_at = cached[6] if len(cached) > 6 else None
+                        if not failed_at or (time.time() - failed_at) < PARSE_RETRY_AFTER_SEC:
+                            continue  # 변경 없고 이미 최신 스키마로 내용까지 색인됨
 
                     _emit_progress(f"{name} 읽는 중…")
                     # 개별 추출기(parsers.py)가 각자 내부적으로 예외를 삼키게 되어
@@ -599,11 +677,18 @@ class Indexer:
                     # 예상 못한 None 케이스가 여기까지 새서 색인 스레드 전체가
                     # 죽었음). 파일 하나의 파싱 실패가 전체 재색인을 멈추게 하면
                     # 안 되므로, 마지막 방어선으로 한 번 더 감싼다.
+                    failed_at = None
                     try:
                         entries = EXTRACTORS[ext](path) if ext in EXTRACTORS else []
                     except Exception:
+                        # 실패를 "내용이 0개인 파일"로 저장하면 안 된다 — mtime/size 가
+                        # 그대로인 한 다시는 시도하지 않아서, 색인 순간에 파일이 잠깐
+                        # 열려 있었다는 이유만으로 그 파일이 검색에서 영구히 빠진다.
+                        # 실패 시각을 남겨서 나중에 다시 시도하게 한다.
                         entries = []
-                    _queue_content(path, path_norm, name, stat.st_mtime, stat.st_size, entries)
+                        failed_at = time.time()
+                    _queue_content(path, path_norm, name, stat.st_mtime, stat.st_size, entries,
+                                    failed_at=failed_at)
 
             # 이 폴더(하위 전체)를 다 훑었다 — 이번 folder_modes 안에 뒤에 처리할
             # 무거운(내용 파싱) 폴더가 더 있어도, 방금 끝난 폴더는 검색창 칩에서
@@ -622,15 +707,31 @@ class Indexer:
         with self._lock:
             meta_snapshot = list(self._meta.items())  # (path_norm, (path, is_dir, content_indexed, entries_schema, mtime, size))
 
+        def _was_visible_this_run(path_norm: str, is_dir: int) -> bool:
+            """이번 스캔이 이 항목을 "봤어야 하는" 범위 안이었는지.
+
+            이걸 안 따지면, 내용 칩만 켠 상태로 색인했을 때 그 폴더의 폴더 행과
+            문서가 아닌 파일들이 전부 "이번에 못 찾았으니 삭제된 것"으로 오인돼
+            통째로 지워진다 — 그리고 파일명 칩을 다시 켜면 되살아나서, 칩을
+            토글할 때마다 색인이 지워졌다 생기고 "색인 갱신됨" 배너가 떴다
+            (실측으로 확인함). 내용 패스는 문서 확장자만 보고 폴더는 아예 기록하지
+            않으므로, 그 범위만으로 삭제를 판단하면 안 된다."""
+            if _under_any(path_norm, scanned_roots_all):
+                return True  # 파일명 패스는 폴더든 파일이든 전부 훑는다
+            if is_dir == 0 and _under_any(path_norm, scanned_roots_content):
+                # 내용 패스는 문서 확장자 파일만 본다 — 그 외 파일은 판단 근거가 없다
+                return os.path.splitext(path_norm)[1].lower() in EXTRACTORS
+            return False
+
         stale_files = [
             path_norm for path_norm, (_path, is_dir, *_rest) in meta_snapshot
             if is_dir == 0 and path_norm not in found_paths
-            and _under_any(path_norm, scanned_roots) and not _under_any(path_norm, denied_paths)
+            and _was_visible_this_run(path_norm, 0) and not _under_any(path_norm, denied_paths)
         ]
         stale_dirs = [
             path_norm for path_norm, (_path, is_dir, *_rest) in meta_snapshot
             if is_dir == 1 and path_norm not in found_dirs
-            and _under_any(path_norm, scanned_roots) and not _under_any(path_norm, denied_paths)
+            and _was_visible_this_run(path_norm, 1) and not _under_any(path_norm, denied_paths)
         ]
         stale = stale_files + stale_dirs
 
@@ -692,6 +793,7 @@ class Indexer:
         sql_limit = min(50000, max(limit * 4, 1000))
 
         allowed_norm = None
+        scope_roots = []  # SQL 단계에서 범위를 좁히는 데 쓸 루트 목록
         if folder_modes is not None:
             # (루트, 접두사, filename_only) — 접두사(끝에 구분자 붙인 버전)를 폴더
             # 개수만큼만 미리 만들어 둔다.
@@ -700,6 +802,14 @@ class Indexer:
                 root_norm = os.path.normcase(os.path.normpath(f))
                 prefix = root_norm if root_norm.endswith(os.sep) else root_norm + os.sep
                 allowed_norm.append((root_norm, prefix, bool(fo)))
+                scope_roots.append(root_norm)
+            # 중복 제거(같은 폴더를 파일명/내용 두 가지로 등록하면 루트가 겹친다).
+            # 모드 구분은 아래 Python 판정에서 하고, SQL 에서는 "이 경로들 안"까지만
+            # 좁히면 된다.
+            scope_roots = list(dict.fromkeys(scope_roots))
+
+        # 세 쿼리 모두 LIMIT 이전에 이 조건으로 범위를 좁힌다(_scope_where 문서 참고).
+        scope_sql, scope_params = _scope_where(scope_roots, "t.path_norm")
 
         def _matched_folders(p_norm: str):
             """p_norm 이 속하는 모든 (폴더_norm, filename_only) 를 반환한다(여러 개 가능 —
@@ -716,7 +826,9 @@ class Indexer:
             # ---- 폴더명 매칭: filename_only 폴더에서만, 폴더 자체를 결과로 보여준다 ----
             dir_rows = _term_search_sql(
                 "files", "name", "files_fts", "t.path, t.path_norm, t.name",
-                con, terms, extra_where="t.is_dir = 1", sql_limit=sql_limit,
+                con, terms,
+                extra_where="t.is_dir = 1" + (f" AND {scope_sql}" if scope_sql else ""),
+                extra_params=tuple(scope_params), sql_limit=sql_limit,
             )
             for path, path_norm, name in dir_rows:
                 matches = _matched_folders(path_norm)
@@ -737,12 +849,21 @@ class Indexer:
             # ---- 파일명 후보 ----
             name_rows = _term_search_sql(
                 "files", "name", "files_fts", "t.path, t.path_norm, t.name",
-                con, terms, extra_where="t.is_dir = 0", sql_limit=sql_limit,
+                con, terms,
+                extra_where="t.is_dir = 0" + (f" AND {scope_sql}" if scope_sql else ""),
+                extra_params=tuple(scope_params), sql_limit=sql_limit,
             )
             name_hits = {path: (path_norm, name) for path, path_norm, name in name_rows}
 
             # ---- 내용 후보 (page/sheet/row 컬럼이 실제 SQL 컬럼이라 인덱스를 탄다) ----
-            content_rows = _content_search_sql(con, terms, sql_limit=sql_limit)
+            # 활성 폴더가 전부 "파일명만"이면 내용 결과는 아래에서 어차피 전부
+            # 버려진다 — 그런데도 질의하면 2글자 검색에서 4만 행을 읽어 파이썬으로
+            # 넘긴 뒤 통째로 버리는 낭비가 생긴다(프로파일로 확인함). 아예 건너뛴다.
+            any_content_mode = allowed_norm is None or any(not fo for _, _, fo in allowed_norm)
+            content_rows = (
+                _content_search_sql(con, terms, sql_limit=sql_limit, scope_roots=scope_roots)
+                if any_content_mode else []
+            )
         finally:
             con.close()
 
@@ -786,16 +907,17 @@ class Indexer:
 
             content_hits = [r for _, r in content_by_path.get(path, [])] if wants_content else []
 
-            if content_hits:
-                # 같은 파일이 파일명 등록과 내용 등록 둘 다에 걸리면("폴더 두 번 추가")
-                # 내용 일치 쪽이 정확한 위치+미리보기까지 주는 상위 정보라, 굳이 "파일명
-                # 일치"를 따로 또 보여주지 않는다 — 그러면 같은 파일이 결과에 여러 번
-                # 나와서 아무거나 두 개 열면 파일이 두 번 열리는 것처럼 보인다.
-                for result in content_hits:
-                    results.append(result)
-                    if len(results) >= limit:
-                        return results
-            elif wants_filename and path in name_hits:
+            # 등록(폴더 칩)은 각각 독립이다. 같은 파일이 파일명 등록과 내용 등록에
+            # 동시에 걸리면 양쪽 결과를 다 낸다 — 검색창에서 서로 다른 칩 아래에
+            # 들어가고, "파일명으로 찾은 것"과 "내용으로 찾은 것"은 사용자에게
+            # 서로 다른 정보이기 때문이다. 예전엔 내용 쪽이 상위 정보라며 파일명
+            # 결과를 버렸는데, 그러면 파일명 칩에서만 보여야 할 결과가 다른 칩의
+            # 등록 때문에 통째로 사라졌다(칩끼리 서로 영향을 주면 안 된다).
+            for result in content_hits:
+                results.append(result)
+                if len(results) >= limit:
+                    return results
+            if wants_filename and path in name_hits:
                 name = name_hits[path][1]
                 name_lower = name.lower()
                 if all(t in name_lower for t in terms):

@@ -17,6 +17,10 @@ from PySide6.QtWidgets import (
 )
 
 import win_focus
+# "이 경로가 저 폴더 안인가" 판단은 드라이브 루트("C:\\") 예외 때문에 직접 짜면
+# 틀리기 쉽다(구분자가 두 번 겹쳐 아무것도 안 걸린다) — indexer 쪽 구현을 그대로
+# 쓴다. 같은 판단이 두 군데서 서로 다르게 돌면 결과가 엉뚱한 폴더로 분류된다.
+from indexer import _is_under as _path_is_under
 from file_opener import open_result, open_containing_folder
 from search_worker import SearchWorker
 
@@ -399,7 +403,9 @@ class ResultDelegate(QStyledItemDelegate):
         self.folder_font = _px_font(title_px(11), QFont.Bold)
         self.member_font = _px_font(title_px(10), QFont.DemiBold)
         self.category_font = _px_font(title_px(10), QFont.DemiBold)
-        self.notice_font = _px_font(title_px(11))
+        # 안내 문구는 검색 결과 자체가 아니라 보조 설명이라, 제목류 중에서도
+        # 가장 작게 둔다(결과 목록을 훑는 데 방해가 안 되게).
+        self.notice_font = _px_font(title_px(9))
         # QFontMetrics 생성 자체가 공짜가 아니라서(폰트 DB 조회), 매 paint()마다
         # 새로 만들지 않고 한 번만 만들어 재사용한다 — 스크롤 중 반복 호출되므로 중요하다.
         self.name_fm = QFontMetrics(self.name_font)
@@ -422,6 +428,25 @@ class ResultDelegate(QStyledItemDelegate):
 
     def notice_height(self) -> int:
         return QFontMetrics(self.notice_font).height() + 16  # 위8 + 아래8
+
+    def notice_link_font(self) -> QFont:
+        font = QFont(self.notice_font)
+        font.setUnderline(True)
+        return font
+
+    def notice_layout(self, payload: dict, avail_width: int):
+        """안내 행의 (실제로 그릴 본문, 링크 시작 x오프셋, 링크 너비).
+
+        그리기와 클릭 판정이 각자 계산하면 한쪽만 바뀌었을 때 링크 위치가 어긋난다
+        — 두 곳 모두 이 함수를 쓴다. 창이 좁아 다 못 담으면 링크는 온전히 남기고
+        본문을 "…"로 줄인다(링크가 잘리면 누를 수가 없다)."""
+        text = payload.get("text", "")
+        link = payload.get("link") or ""
+        fm = QFontMetrics(self.notice_font)
+        link_w = QFontMetrics(self.notice_link_font()).horizontalAdvance(link) if link else 0
+        if link and fm.horizontalAdvance(text) + link_w > avail_width:
+            text = fm.elidedText(text, Qt.ElideRight, max(0, avail_width - link_w))
+        return text, fm.horizontalAdvance(text), link_w
 
     def measure_result(self, result: dict) -> int:
         has_snippet = bool(result.get("snippet"))
@@ -465,10 +490,19 @@ class ResultDelegate(QStyledItemDelegate):
                                 CATEGORY_COLOR_HOVER if (hovered or selected) else CATEGORY_COLOR,
                                 self.CATEGORY_H_PAD)
         elif kind == "notice":
+            text_rect = rect.adjusted(self.NOTICE_H_PAD, 0, -self.NOTICE_H_PAD, 0)
+            body, link_dx, link_w = self.notice_layout(payload, text_rect.width())
             painter.setFont(self.notice_font)
             painter.setPen(NOTICE_COLOR)
-            painter.drawText(rect.adjusted(self.NOTICE_H_PAD, 0, -self.NOTICE_H_PAD, 0), Qt.AlignVCenter,
-                              payload.get("text", ""))
+            painter.drawText(text_rect, Qt.AlignVCenter, body)
+            # 안내 뒤에 "표시 개수 바꾸기" 를 링크처럼 이어 붙인다 — 클릭 판정은
+            # ResultsListWidget 이 같은 notice_layout() 으로 위치를 구한다.
+            if link_w:
+                painter.setFont(self.notice_link_font())
+                painter.setPen(LOC_COLOR)
+                painter.drawText(QRect(text_rect.left() + link_dx, text_rect.top(),
+                                        link_w, text_rect.height()),
+                                  Qt.AlignVCenter, payload.get("link", ""))
 
         painter.restore()
 
@@ -580,7 +614,29 @@ class ResultsListWidget(QListWidget):
                     self._on_header_click(payload)
                     event.accept()
                     return
+                elif kind == "notice" and payload.get("link"):
+                    # 안내 문구 뒤의 링크 글자 위를 눌렀을 때만 반응한다.
+                    if self._point_on_notice_link(idx, event.position().toPoint()):
+                        self._on_header_click(payload)
+                        event.accept()
+                        return
         super().mousePressEvent(event)
+
+    def _notice_link_range(self, idx):
+        """안내 행에서 링크 글자가 차지하는 x 범위(left, right).
+        위치 계산은 델리게이트의 notice_layout() 하나만 쓴다(그리기와 클릭 판정이
+        따로 계산하면 한쪽만 바뀌었을 때 어긋난다)."""
+        delegate = self.itemDelegate()
+        payload = idx.data(Qt.UserRole) or {}
+        rect = self.visualRect(idx)
+        avail = rect.width() - delegate.NOTICE_H_PAD * 2
+        _body, link_dx, link_w = delegate.notice_layout(payload, avail)
+        left = rect.left() + delegate.NOTICE_H_PAD + link_dx
+        return left, left + link_w
+
+    def _point_on_notice_link(self, idx, pos) -> bool:
+        left, right = self._notice_link_range(idx)
+        return left <= pos.x() <= right
 
     def _point_on_header_text(self, idx, pos) -> bool:
         delegate = self.itemDelegate()
@@ -596,9 +652,15 @@ class ResultsListWidget(QListWidget):
         return text_left <= pos.x() <= text_left + text_width
 
     def mouseMoveEvent(self, event):
-        idx = self.indexAt(event.position().toPoint())
-        kind = (idx.data(Qt.UserRole) or {}).get("kind") if idx.isValid() else None
-        self.viewport().setCursor(Qt.PointingHandCursor if kind in HEADER_KINDS else Qt.ArrowCursor)
+        pos = event.position().toPoint()
+        idx = self.indexAt(pos)
+        payload = (idx.data(Qt.UserRole) or {}) if idx.isValid() else {}
+        kind = payload.get("kind")
+        if kind == "notice" and payload.get("link"):
+            hand = self._point_on_notice_link(idx, pos)
+        else:
+            hand = kind in HEADER_KINDS
+        self.viewport().setCursor(Qt.PointingHandCursor if hand else Qt.ArrowCursor)
         super().mouseMoveEvent(event)
 
 
@@ -771,7 +833,8 @@ class ResultsPopup(QWidget):
 
 
 class SearchWindow(QWidget):
-    open_settings_requested = Signal()
+    # 인자는 "어느 설정으로 보낼지"(예: "display_limit"). 빈 문자열이면 그냥 연다.
+    open_settings_requested = Signal(str)
 
     def __init__(self, indexer, settings):
         super().__init__()
@@ -891,7 +954,9 @@ class SearchWindow(QWidget):
         self.settings_btn.setObjectName("settingsBtn")
         self.settings_btn.setIcon(_gear_icon())
         self.settings_btn.setIconSize(QSize(16, 16))
-        self.settings_btn.clicked.connect(self.open_settings_requested.emit)
+        # clicked 는 checked(bool) 를 넘겨주므로 emit 에 직접 연결하면 안 된다
+        # (시그널 인자가 str 이라 타입이 안 맞는다) — 빈 문자열로 감싸서 보낸다.
+        self.settings_btn.clicked.connect(lambda: self.open_settings_requested.emit(""))
         row_layout.addWidget(self.settings_btn)
 
         card_layout.addWidget(input_row)
@@ -1179,8 +1244,7 @@ class SearchWindow(QWidget):
             members = self.settings.folder_groups.get(f)
             candidates = members if members else [f]
             for c in candidates:
-                cn = os.path.normcase(os.path.normpath(c))
-                if p == cn or p.startswith(cn + os.sep):
+                if _path_is_under(p, os.path.normcase(os.path.normpath(c))):
                     owners.append(f)
                     break
         return owners
@@ -1189,8 +1253,7 @@ class SearchWindow(QWidget):
         """그룹으로 묶인 결과가 실제로는 그룹 안의 어느 폴더에서 왔는지 찾는다."""
         p = os.path.normcase(os.path.normpath(path))
         for m in self.settings.folder_groups.get(group_key, []):
-            mn = os.path.normcase(os.path.normpath(m))
-            if p == mn or p.startswith(mn + os.sep):
+            if _path_is_under(p, os.path.normcase(os.path.normpath(m))):
                 return m
         return None
 
@@ -1230,7 +1293,14 @@ class SearchWindow(QWidget):
         def label_of(folder):
             return self._folder_display_name(folder) if folder else "기타"
 
-        ordered_folders = sorted(groups.keys(), key=lambda f: label_of(f))
+        # 결과 묶음 순서 = 검색창 아래 폴더 칩 순서(= 설정 표의 순서). 예전엔 표시
+        # 이름 ㄱㄴㄷ순이라, 설정에서 순서를 바꿔도 결과 순서는 그대로여서 둘이
+        # 따로 놀았다. 어느 등록에도 안 속한 "기타"는 항상 맨 뒤로 보낸다.
+        chip_order = {f: i for i, f in enumerate(self.settings.folders)}
+        ordered_folders = sorted(
+            groups.keys(),
+            key=lambda f: (chip_order.get(f, len(chip_order)), label_of(f)),
+        )
 
         plan = []
         for folder in ordered_folders:
@@ -1629,7 +1699,9 @@ class SearchWindow(QWidget):
                 notice.setFlags(Qt.ItemIsEnabled)
                 notice.setData(Qt.UserRole, {
                     "kind": "notice",
-                    "text": f"결과가 많아 상위 {self.settings.search_display_limit}개만 표시 — 검색어를 더 구체적으로 입력해보세요",
+                    "text": f"결과가 많아 상위 {self.settings.search_display_limit:,}개만 표시 — "
+                            f"검색어를 더 구체적으로 입력해보세요.  ",
+                    "link": "표시 개수 바꾸기",
                 })
                 notice.setSizeHint(QSize(width, self._delegate.notice_height()))
                 self.results_list.addItem(notice)
@@ -1701,6 +1773,10 @@ class SearchWindow(QWidget):
             self._toggle_folder(payload["label"])
         elif payload["kind"] == "member":
             self._toggle_member(payload["key"])
+        elif payload["kind"] == "notice":
+            # "표시 개수 바꾸기" 링크 — 옵션 창을 그냥 여는 게 아니라 해당 설정이
+            # 있는 페이지로 보내고 그 칸을 잠깐 강조한다.
+            self.open_settings_requested.emit("display_limit")
         else:
             self._toggle_category(payload["key"])
 

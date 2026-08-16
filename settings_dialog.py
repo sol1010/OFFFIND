@@ -3,7 +3,7 @@ import os
 import uuid
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QIcon, QPalette
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QCheckBox, QSlider,
@@ -343,9 +343,13 @@ class SettingsDialog(QDialog):
 
     saved = Signal()
 
-    def __init__(self, settings, parent=None):
+    def __init__(self, settings, parent=None, focus: str = ""):
+        """focus 가 주어지면 그 설정 칸이 있는 페이지를 열고 잠깐 강조한다
+        (검색 결과의 "표시 개수 바꾸기" 링크처럼, 특정 설정으로 바로 보내야
+        할 때 쓴다)."""
         super().__init__(parent)
         self.settings = settings
+        self._focus_key = focus
         self.setWindowTitle("OFFFIND 옵션")
         self.setMinimumWidth(520)
         # 스타일시트만 걸어두면, 새 네이티브 창이 뜰 때 QSS가 실제로 칠해지기
@@ -374,7 +378,10 @@ class SettingsDialog(QDialog):
             if m in settings.folder_display_name
         }
         self._expanded_groups = set()  # 이번 세션에 펼쳐 놓은 그룹 키들
+        self._page_row_by_key = {}  # 'display_limit' 같은 키 -> 사이드바 행 번호
         self._build_ui()
+        if focus:
+            self._go_to(focus)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -411,9 +418,10 @@ class SettingsDialog(QDialog):
         item.setForeground(QColor("#8a8f98"))
         self.nav.addItem(item)
 
-    def _new_page(self, title: str):
+    def _new_page(self, title: str, key: str = ""):
         """제목만 얹은 빈 페이지를 만들어 스택에 넣고, 사이드바에도 항목을
-        추가한다. 반환한 세로 레이아웃에 페이지 내용을 채우면 된다."""
+        추가한다. 반환한 세로 레이아웃에 페이지 내용을 채우면 된다.
+        key 를 주면 나중에 _go_to(key) 로 그 페이지를 바로 열 수 있다."""
         page = QWidget()
         page_layout = QVBoxLayout(page)
         page_layout.setContentsMargins(0, 0, 0, 0)
@@ -432,13 +440,38 @@ class SettingsDialog(QDialog):
         self.pages.addWidget(page)
         nav_item = QListWidgetItem(title)
         self.nav.addItem(nav_item)
-        self._nav_page_index[self.nav.row(nav_item)] = index
+        row = self.nav.row(nav_item)
+        self._nav_page_index[row] = index
+        if key:
+            self._page_row_by_key[key] = row
         return page_layout
 
     def _on_nav_changed(self, row: int):
         index = self._nav_page_index.get(row)
         if index is not None:
             self.pages.setCurrentIndex(index)
+
+    def _go_to(self, key: str):
+        """그 설정이 있는 페이지를 열고, 해당 입력칸을 잠깐 강조한다."""
+        row = self._page_row_by_key.get(key)
+        if row is None:
+            return
+        self.nav.setCurrentRow(row)
+        widget = {"display_limit": lambda: self.display_limit_spin}.get(key)
+        if widget:
+            self._flash(widget())
+
+    def _flash(self, widget, msec: int = 1100):
+        """어느 칸을 보러 온 건지 눈에 띄게 잠깐 테두리를 준다.
+
+        전역 스타일시트가 이미 이 위젯을 칠하고 있어서, 인스턴스에 직접 건
+        스타일시트로 잠시 덮어썼다가 원래대로(빈 문자열) 돌려놓는다."""
+        widget.setFocus()
+        widget.setStyleSheet(
+            "border: 2px solid #8ab4f8;"
+            "background-color: rgba(138, 180, 248, 45);"
+        )
+        QTimer.singleShot(msec, lambda: widget.setStyleSheet(""))
 
     def _section(self, parent_layout, title: str) -> QFormLayout:
         """페이지 안의 한 묶음(작은 회색 제목 + 폼)을 만들고 그 폼을 돌려준다.
@@ -547,7 +580,7 @@ class SettingsDialog(QDialog):
         general_page.addStretch(1)
 
         # ---------- 검색 결과 표시 ----------
-        display_page = self._new_page("검색 결과 표시")
+        display_page = self._new_page("검색 결과 표시", key="display_limit")
         display_row = QHBoxLayout()
         display_row.setSpacing(0)
         display_page.addLayout(display_row)
@@ -594,7 +627,15 @@ class SettingsDialog(QDialog):
         self.display_limit_spin.setValue(self.settings.search_display_limit)
         form.addRow(self._form_label("한 번에 표시"), self.display_limit_spin)
 
-        limit_hint = QLabel("이 개수를 넘으면 결과 맨 위에 안내가 뜹니다. 많이 올려도 목록은 보이는 만큼만 그려서 느려지지 않습니다.")
+        # 예전엔 "많이 올려도 느려지지 않는다"고 써 뒀는데 사실이 아니다 — 그건
+        # 화면에 그리는 비용에만 해당하고, 이 값이 SQLite 가 훑는 양(약 4배)과
+        # 미리보기를 만드는 양을 그대로 정한다(2글자 검색 기준 1,000이면 약 0.1초,
+        # 10,000이면 약 0.6초로 실측됨). 사용자에게는 색인이 어떻게 도는지까지
+        # 설명할 필요가 없으니 "속도에 영향이 있다"까지만 알린다.
+        limit_hint = QLabel(
+            "이 개수를 넘으면 결과 맨 위에 안내가 뜹니다.\n"
+            "숫자가 크면 검색 속도에 영향을 줄 수 있습니다. 기본값 2,000"
+        )
         limit_hint.setWordWrap(True)
         limit_hint.setStyleSheet("color: #9aa0a6; font-size: 11px;")
         form.addRow("", limit_hint)

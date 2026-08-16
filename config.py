@@ -47,7 +47,10 @@ DEFAULTS = {
     "filename_font_px": 11,
     "content_font_px": 12,
     "snippet_max_lines": 3,
-    "search_display_limit": 10000,
+    # 크게 잡을수록 SQLite 가 훑는 양과 미리보기 만드는 양이 같이 늘어난다
+    # (2글자 검색 기준 1,000이면 약 0.1초, 10,000이면 약 0.6초로 실측). 결과를
+    # 그만큼 다 보는 일은 드물어서, 체감이 빠른 쪽으로 기본값을 잡는다.
+    "search_display_limit": 2000,
 }
 
 

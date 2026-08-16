@@ -218,7 +218,9 @@ class App:
             self.tray.show_message("색인 완료", f"{count}개 파일이 색인되었습니다.")
 
     # ---------- 옵션 ----------
-    def open_settings(self):
+    def open_settings(self, focus: str = ""):
+        """focus 가 있으면 그 설정이 있는 페이지를 열고 해당 칸을 잠깐 강조한다
+        (검색 결과의 "표시 개수 바꾸기" 링크에서 넘어올 때)."""
         # 검색창은 기본적으로 "항상 위"(always_on_top)라서, 이 창이 아직 떠 있는
         # 채로 설정창(항상 위 아님)을 띄우려 하면 포그라운드 쟁탈전이 나서
         # 설정창이 안 보이거나 멈춘 것처럼 보였다(실제로 겪음) — WindowDeactivate로
@@ -229,7 +231,7 @@ class App:
         old_folder_modes = dict(self.settings.folder_filename_only)
         old_folder_groups = {k: list(v) for k, v in self.settings.folder_groups.items()}
 
-        dialog = SettingsDialog(self.settings)
+        dialog = SettingsDialog(self.settings, focus=focus)
         self._settings_dialog = dialog
         # winId()가 네이티브 창을 만들어내는 부작용이 있다 — 아직 화면에 보이기
         # 전(첫 show() 이전)에 미리 호출해서, 애니메이션을 끄는 시점이 창이

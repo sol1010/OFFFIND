@@ -10,5 +10,9 @@ release_assets/
 app_log_run.txt
 app_log_err.txt
 
+# 테스트 임시 파일 (사용자 색인 범위에 안 섞이도록 저장소 안에 만든다)
+.pytest_tmp/
+.pytest_cache/
+
 # 개인 테스트/업무용 폴더 - 공개 저장소에 올리면 안 되는 실제 파일이 들어있음
 검색자료/
