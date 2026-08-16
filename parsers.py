@@ -15,18 +15,26 @@ def extract_xlsx(path: str) -> List[Dict[str, Any]]:
         return entries
 
     try:
-        for sheet in wb.worksheets:
-            for row_idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-                cells = [str(c) for c in row if c is not None and str(c).strip() != ""]
-                if not cells:
-                    continue
-                text = " | ".join(cells)
-                entries.append({
-                    "location": f"{sheet.title} · {row_idx}행",
-                    "text": text,
-                    "sheet": sheet.title,
-                    "row": row_idx,
-                })
+        # docx/pptx 추출기와 마찬가지로, 시트/행 하나에서 예상 못한 예외가 나도
+        # 그때까지 뽑은 entries는 살린다 — 이 감싸기가 없으면 예외가 finally만
+        # 거치고 return entries 줄 자체를 건너뛰어서, 앞선 시트들에서 이미 잘
+        # 뽑아둔 내용까지 호출자(rebuild())의 바깥쪽 except가 통째로 버리게 된다
+        # (pptx 노트에서 실제로 겪었던 것과 같은 종류의 항목별 파싱 실패).
+        try:
+            for sheet in wb.worksheets:
+                for row_idx, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+                    cells = [str(c) for c in row if c is not None and str(c).strip() != ""]
+                    if not cells:
+                        continue
+                    text = " | ".join(cells)
+                    entries.append({
+                        "location": f"{sheet.title} · {row_idx}행",
+                        "text": text,
+                        "sheet": sheet.title,
+                        "row": row_idx,
+                    })
+        except Exception:
+            pass
     finally:
         wb.close()
     return entries

@@ -47,6 +47,7 @@ DEFAULTS = {
     "filename_font_px": 11,
     "content_font_px": 12,
     "snippet_max_lines": 3,
+    "search_display_limit": 10000,
 }
 
 
@@ -71,6 +72,7 @@ class Settings:
     filename_font_px: int = DEFAULTS["filename_font_px"]
     content_font_px: int = DEFAULTS["content_font_px"]
     snippet_max_lines: int = DEFAULTS["snippet_max_lines"]
+    search_display_limit: int = DEFAULTS["search_display_limit"]
 
     def __post_init__(self):
         # 실제 설정 파일 경로. dataclass 필드가 아니라서 JSON에는 저장되지 않는다.

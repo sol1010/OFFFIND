@@ -43,7 +43,12 @@ def _default_handler_exe(ext: str):
 
     command = command.strip()
     if command.startswith('"'):
-        return command[1:command.index('"', 1)]
+        # 레지스트리 값이 어떤 이유로든 닫는 따옴표 없이 깨져 있으면(예: 일부
+        # 서드파티 설치 프로그램의 버그) index()가 ValueError를 던지는데, 이 함수를
+        # 부르는 open_result()는 OSError만 잡고 있다 — 여기서 못 찾으면 그냥 실패로
+        # 취급해서 나머지 코드가 기본 프로그램으로 여는 폴백을 타게 한다.
+        end = command.find('"', 1)
+        return command[1:end] if end != -1 else None
     return command.split(" ")[0]
 
 
@@ -117,6 +122,14 @@ def _open_powerpoint(path: str, slide):
         except Exception:
             pass
     os.startfile(path)
+
+
+def open_containing_folder(path: str):
+    """탐색기를 열어 이 파일을 선택된 상태로 보여준다."""
+    try:
+        subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+    except OSError:
+        pass
 
 
 def open_result(result: dict):

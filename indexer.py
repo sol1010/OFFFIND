@@ -134,11 +134,19 @@ def _connect() -> sqlite3.Connection:
 
 def _term_search_sql(table: str, text_col: str, fts_table: str, select_cols: str,
                       con: sqlite3.Connection, terms: List[str], extra_where: str = "",
-                      extra_params: tuple = ()):
+                      extra_params: tuple = (), sql_limit: int = 3000):
     """terms 전부가 text_col 에 부분일치하는 행을 반환한다. 전부 3글자 이상이면
     FTS5(trigram) MATCH — 인덱스를 타서 매칭되는 것만 바로 찾는다. 하나라도 2글자
     이하면 trigram 인덱스가 토큰 자체를 안 만들어서 매칭이 안 되므로 LIKE 로
-    폴백한다(전량 스캔이지만 SQLite C 엔진이라 Python 반복문보다 빠르다)."""
+    폴백한다(전량 스캔이지만 SQLite C 엔진이라 Python 반복문보다 빠르다).
+
+    SQL에 LIMIT을 반드시 걸어야 한다 — 예전엔 없어서, "a"처럼 흔한 1~2글자
+    검색어가 파일 70만+ 개 중 수만 건에 매칭되면 그 전부를 fetchall()로 끌어온
+    다음에야 Python 쪽 limit(표시 500개)이 적용됐다. 결과가 많이 매칭될수록
+    화면엔 어차피 "더 구체적으로 입력하라"는 안내만 보여주면서 검색이 6초 넘게
+    걸리는 원인이었다(실측으로 확인함). LIMIT이 있으면 SQLite가 그만큼 찾자마자
+    스캔을 멈춘다. sql_limit은 최종 표시 개수보다 넉넉히 크게 잡아서(기본 3000),
+    이후 폴더 범위 필터링/내용-파일명 중복 제거에 쓸 후보가 부족해지지 않게 한다."""
     where = f" AND {extra_where}" if extra_where else ""
     if all(len(t) >= 3 for t in terms):
         match_expr = " ".join('"' + t.replace('"', '""') + '"' for t in terms)
@@ -148,24 +156,26 @@ def _term_search_sql(table: str, text_col: str, fts_table: str, select_cols: str
                 SELECT {select_cols} FROM {fts_table}
                 JOIN {table} t ON t.id = {fts_table}.rowid
                 WHERE {fts_table} MATCH ?{where}
+                LIMIT ?
                 """,
-                (match_expr, *extra_params),
+                (match_expr, *extra_params, sql_limit),
             ).fetchall()
         except sqlite3.OperationalError:
             pass  # 검색어에 FTS5 구문을 깨는 문자가 있으면 LIKE 로 안전하게 폴백
     conds = " AND ".join([f"t.{text_col} LIKE ?"] * len(terms))
     params = [f"%{t}%" for t in terms]
     return con.execute(
-        f"SELECT {select_cols} FROM {table} t WHERE {conds}{where}",
-        [*params, *extra_params],
+        f"SELECT {select_cols} FROM {table} t WHERE {conds}{where} LIMIT ?",
+        [*params, *extra_params, sql_limit],
     ).fetchall()
 
 
-def _content_search_sql(con: sqlite3.Connection, terms: List[str]):
+def _content_search_sql(con: sqlite3.Connection, terms: List[str], sql_limit: int = 3000):
     """terms 전부가 내용 텍스트에 부분일치하는 (path, path_norm, name, location, text,
     page, sheet, row_num, paragraph, slide) 행을 반환한다. content_entries 는 files 와
     별도 테이블이라 files 를 조인해야 하므로 _term_search_sql 의 단일 테이블 가정을
-    그대로 못 쓴다."""
+    그대로 못 쓴다. sql_limit 이유는 _term_search_sql 문서 참고 — content_entries는
+    행 하나하나가 문장 전체라 LIKE 스캔 비용이 더 크다."""
     select_cols = ("f.path, f.path_norm, f.name, ce.location, ce.text, "
                    "ce.page, ce.sheet, ce.row_num, ce.paragraph, ce.slide")
     if all(len(t) >= 3 for t in terms):
@@ -178,8 +188,9 @@ def _content_search_sql(con: sqlite3.Connection, terms: List[str]):
                 JOIN content_entries ce ON ce.id = content_fts.rowid
                 JOIN files f ON f.id = ce.file_id
                 WHERE content_fts MATCH ?
+                LIMIT ?
                 """,
-                (match_expr,),
+                (match_expr, sql_limit),
             ).fetchall()
         except sqlite3.OperationalError:
             pass  # 검색어에 FTS5 구문을 깨는 문자가 있으면 LIKE 로 안전하게 폴백
@@ -190,8 +201,9 @@ def _content_search_sql(con: sqlite3.Connection, terms: List[str]):
         SELECT {select_cols}
         FROM content_entries ce JOIN files f ON f.id = ce.file_id
         WHERE {conds}
+        LIMIT ?
         """,
-        params,
+        [*params, sql_limit],
     ).fetchall()
 
 
@@ -321,7 +333,10 @@ class Indexer:
 
     # ---------- 색인 ----------
     def rebuild(self, folder_modes: List[tuple], progress: Optional[Callable[[str], None]] = None,
-                cancel_check: Optional[Callable[[], bool]] = None):
+                cancel_check: Optional[Callable[[], bool]] = None,
+                folder_done: Optional[Callable[[str, bool], None]] = None,
+                folder_progress: Optional[Callable[[str, int, int], None]] = None,
+                all_folder_modes: Optional[List[tuple]] = None):
         """folder_modes: (폴더 경로, filename_only) 목록.
         filename_only 폴더는 확장자 제한 없이 모든 파일명을 대상으로 하고, 내용은 파싱하지
         않는다(엑셀/PDF를 열어 읽는 과정을 통째로 건너뛰므로 색인이 훨씬 빠르다 — 파일명
@@ -342,6 +357,7 @@ class Indexer:
         found_dirs = set()
         scanned_roots = []  # 이번 호출에서 실제로 스캔을 시작한 폴더 (stale 정리 범위 제한용)
         denied_paths = []   # 접근거부 등으로 열거 자체를 못한 하위 경로 (stale 정리에서 제외)
+        changed = [False]  # 새 파일/변경/삭제가 하나라도 있었는지 — "색인 갱신됨" 배너 표시 여부에 씀
 
         # 진행 상황 알림: 파일마다 emit하면(수십만 번) 신호 폭주로 오히려 느려지니
         # 일정 시간 간격으로만 보낸다. 콘텐츠 파싱 중 progress(name) 호출도 같은
@@ -361,8 +377,19 @@ class Indexer:
         # (설정 화면에서 같은 경로를 두 번 추가), 처리 순서에 따라 filename_only 쪽이
         # 나중에 돌면서 방금 파싱한 내용을 덮어써버릴 수 있다. 내용 모드로도 덮이는
         # 경로 범위를 미리 알아두고, filename_only 처리에서는 그 범위를 건드리지 않는다.
+        #
+        # 이 범위는 반드시 "이번 호출에 넘어온 folder_modes"가 아니라 "등록된 폴더
+        # 전체"를 기준으로 계산해야 한다 — main.py가 활성/비활성 폴더를 선택 라운드/
+        # 나머지 라운드로 나눠서 rebuild()를 각각 따로 부르는데(검색창에 보여줄
+        # 진행상황을 구분하려고), 같은 폴더가 한쪽엔 내용 모드로, 다른 쪽엔 파일명만
+        # 모드로 등록돼 있으면(그룹으로 중복 등록) 그 둘이 서로 다른 rebuild() 호출에
+        # 나뉘어 들어간다. folder_modes만 보고 계산하면 "나머지" 라운드는 그 폴더가
+        # 내용 모드로도 등록돼 있다는 사실 자체를 몰라서, 방금 몇 분씩 걸려 색인한
+        # 내용을 파일명만 라운드가 그대로 지워버리는 사고가 났다(실측으로 발견 —
+        # 내용 색인이 끝난 것처럼 보이다가 다음 라운드에서 content_entries가 통째로
+        # 0으로 리셋됨). all_folder_modes가 주어지면 그걸 기준으로 계산한다.
         content_mode_roots = [
-            os.path.normcase(os.path.normpath(f)) for f, fo in folder_modes
+            os.path.normcase(os.path.normpath(f)) for f, fo in (all_folder_modes or folder_modes)
             if not fo and os.path.isdir(f)
         ]
 
@@ -374,25 +401,118 @@ class Indexer:
         content_pending: Dict[str, tuple] = {}  # path_norm -> (path, name, mtime, size, entries)
         downgrade_norms = []  # 예전엔 내용까지 색인됐는데 이번엔 파일명만으로 바뀐 path_norm (content_entries 정리 대상)
 
+        # 예전엔 전체 스캔(여러 폴더, 최대 수십만 개 파일)이 다 끝난 뒤에야 한 번에
+        # 커밋했다 — 그러다 보니 앱이 중간에 죽거나(강제종료) 취소되면 이미 다 훑고
+        # 파싱한 것까지 통째로 날아가서, 다음 실행 때 처음부터 다시 훑어야 했다
+        # (엑셀/PDF 내용 파싱이 있는 폴더는 파일 하나하나 여는 게 오래 걸려서 특히
+        # 뼈아팠음 — 실측으로 확인함: 재시작할 때마다 매번 처음부터). 일정量 쌓일
+        # 때마다 중간 커밋해서, 죽거나 취소돼도 그때까지 훑은 건 남게 한다.
+        FLUSH_EVERY = 300
+
+        def _flush():
+            if not pending and not content_pending and not downgrade_norms:
+                return
+            with self._lock:
+                con = _connect()
+                try:
+                    if pending:
+                        con.executemany(_UPSERT_FILE_SQL, list(pending.values()))
+
+                    if downgrade_norms:
+                        CHUNK = 500
+                        for i in range(0, len(downgrade_norms), CHUNK):
+                            chunk = downgrade_norms[i:i + CHUNK]
+                            placeholders = ",".join("?" * len(chunk))
+                            con.execute(
+                                f"DELETE FROM content_entries WHERE file_id IN "
+                                f"(SELECT id FROM files WHERE path_norm IN ({placeholders}))",
+                                chunk,
+                            )
+
+                    for path_norm, (path, name, mtime, size, entries) in content_pending.items():
+                        cur = con.execute(
+                            _INSERT_FILE_RETURNING_ID_SQL,
+                            (path, path_norm, name, 0, 1, 1, mtime, size),
+                        )
+                        file_id = cur.fetchone()[0]
+                        con.execute("DELETE FROM content_entries WHERE file_id = ?", (file_id,))
+                        if entries:
+                            con.executemany(
+                                "INSERT INTO content_entries (file_id, location, text, page, sheet, row_num, paragraph, slide) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                [(file_id, e["location"], e["text"], e.get("page"), e.get("sheet"), e.get("row"),
+                                  e.get("paragraph"), e.get("slide"))
+                                 for e in entries],
+                            )
+                    con.commit()
+                finally:
+                    con.close()
+            pending.clear()
+            content_pending.clear()
+            downgrade_norms.clear()
+
+        def _maybe_flush():
+            if len(pending) + len(content_pending) >= FLUSH_EVERY:
+                _flush()
+
         def _queue_plain(path, path_norm, name, is_dir):
             pending[path_norm] = (path, path_norm, name, is_dir, 0, 0, None, None)
             with self._lock:
                 self._meta[path_norm] = (path, is_dir, 0, 0, None, None)
+            changed[0] = True
+            _maybe_flush()
 
         def _queue_content(path, path_norm, name, mtime, size, entries):
             content_pending[path_norm] = (path, name, mtime, size, entries)
             with self._lock:
                 self._meta[path_norm] = (path, 0, 1, 1, mtime, size)
+            changed[0] = True
+            _maybe_flush()
+
+        # 설정에서 같은 폴더를 같은 검색 방식으로 두 번 등록해 뒀을 수 있다(예:
+        # "그냥 두 개 다 보여주자" 방식으로 UI에서 중복을 허용하기로 함) — 실제
+        # 디스크 스캔은 어차피 완전히 똑같은 결과를 내므로, 정확히 같은 (경로,
+        # 검색 방식) 조합을 이 호출 안에서 두 번째부터는 실제로 훑지 않는다.
+        # folder_done은 등록 횟수만큼 그대로 보내야 한다(main.py가 등록별로
+        # 카운트를 세서 로딩 표시를 관리하기 때문 — 스킵해도 신호는 보낸다).
+        seen_exact_modes = set()
 
         for folder, filename_only in folder_modes:
             if not os.path.isdir(folder):
                 continue
-            scanned_roots.append(os.path.normcase(os.path.normpath(folder)))
+            folder_norm = os.path.normcase(os.path.normpath(folder))
+            scanned_roots.append(folder_norm)
+
+            exact_key = (folder_norm, bool(filename_only))
+            if exact_key in seen_exact_modes:
+                if folder_done:
+                    folder_done(folder_norm, bool(filename_only))
+                continue
+            seen_exact_modes.add(exact_key)
+
+            # 진행률(%) 표시용 기준 총량 — 정확한 총 개수는 미리 다 훑어봐야 알 수
+            # 있어서(비용이 큼) 대신 지난번 색인 때 이 폴더 밑에 있던 파일 수를
+            # 어림값으로 쓴다. 첫 색인(기준값 없음)이면 퍼센트 없이 "색인 중…"만
+            # 보여주는 쪽으로 처리한다(GUI 쪽에서 total<=0이면 None 반환).
+            with self._lock:
+                folder_total_hint = sum(1 for pn in self._meta if _is_under(pn, folder_norm))
+            folder_found = [0]
+            _last_folder_progress_at = [0.0]
+
+            def _emit_folder_progress():
+                if not folder_progress:
+                    return
+                now = time.perf_counter()
+                if now - _last_folder_progress_at[0] < 0.2:
+                    return
+                _last_folder_progress_at[0] = now
+                folder_progress(folder_norm, folder_found[0], folder_total_hint)
 
             stack = [folder]
             while stack:
                 if cancel_check and cancel_check():
-                    return
+                    _flush()
+                    return changed[0]
                 current = stack.pop()
                 try:
                     entries_iter = list(os.scandir(current))
@@ -405,6 +525,7 @@ class Indexer:
 
                 for entry in entries_iter:
                     if cancel_check and cancel_check():
+                        _flush()
                         return
                     try:
                         is_dir = entry.is_dir()  # follow_symlinks=True(기본): 링크로 연결된 폴더도 목록엔 포함
@@ -434,6 +555,15 @@ class Indexer:
                     path_norm = os.path.normcase(os.path.normpath(path))
                     found_paths.add(path_norm)
                     _emit_progress(f"{len(found_paths):,}개 확인 중…")
+                    folder_found[0] += 1
+                    _emit_folder_progress()
+                    if len(found_paths) % 100 == 0:
+                        # 색인 스레드 우선순위를 낮춰도(QThread.LowPriority) GIL은 OS
+                        # 우선순위와 무관하게 스레드 간에 나눠 써서, 이 스레드가 계속
+                        # CPU를 쓰면 검색창 텍스트 입력(메인 스레드)이 밀릴 수 있다 —
+                        # 실측으로 확인함(입력이 느려짐). time.sleep(0)은 그 자리에서
+                        # GIL을 확실히 내놓게 강제한다.
+                        time.sleep(0)
 
                     cached = self._meta.get(path_norm)  # (path, is_dir, content_indexed, entries_schema, mtime, size)
                     has_content = cached is not None and cached[2] == 1
@@ -475,6 +605,15 @@ class Indexer:
                         entries = []
                     _queue_content(path, path_norm, name, stat.st_mtime, stat.st_size, entries)
 
+            # 이 폴더(하위 전체)를 다 훑었다 — 이번 folder_modes 안에 뒤에 처리할
+            # 무거운(내용 파싱) 폴더가 더 있어도, 방금 끝난 폴더는 검색창 칩에서
+            # 바로 로딩 표시를 내려도 된다. 그러려면 여기 쌓인 것부터 커밋해야
+            # 실제로 검색 가능한 상태가 된다(search()는 self._meta가 아니라 DB를
+            # 직접 읽는다) — 폴더별 완료를 알리기 전에 먼저 flush.
+            _flush()
+            if folder_done:
+                folder_done(os.path.normcase(os.path.normpath(folder)), bool(filename_only))
+
         # 삭제된 파일/폴더 정리: 이번에 실제로 스캔에 성공한 루트 범위 안에서만 지운다
         # (접근거부로 못 본 하위 트리는 범위에서 제외 — 못 찾은 걸 삭제된 걸로 오인하지 않게).
         def _under_any(p_norm: str, roots: list) -> bool:
@@ -495,40 +634,12 @@ class Indexer:
         ]
         stale = stale_files + stale_dirs
 
-        with self._lock:
-            con = _connect()
-            try:
-                if pending:
-                    con.executemany(_UPSERT_FILE_SQL, list(pending.values()))
+        _flush()  # 위 스캔 루프에서 FLUSH_EVERY 단위로 이미 대부분 커밋됐고, 남은 나머지만 여기서 마저 커밋한다
 
-                if downgrade_norms:
-                    CHUNK = 500
-                    for i in range(0, len(downgrade_norms), CHUNK):
-                        chunk = downgrade_norms[i:i + CHUNK]
-                        placeholders = ",".join("?" * len(chunk))
-                        con.execute(
-                            f"DELETE FROM content_entries WHERE file_id IN "
-                            f"(SELECT id FROM files WHERE path_norm IN ({placeholders}))",
-                            chunk,
-                        )
-
-                for path_norm, (path, name, mtime, size, entries) in content_pending.items():
-                    cur = con.execute(
-                        _INSERT_FILE_RETURNING_ID_SQL,
-                        (path, path_norm, name, 0, 1, 1, mtime, size),
-                    )
-                    file_id = cur.fetchone()[0]
-                    con.execute("DELETE FROM content_entries WHERE file_id = ?", (file_id,))
-                    if entries:
-                        con.executemany(
-                            "INSERT INTO content_entries (file_id, location, text, page, sheet, row_num, paragraph, slide) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                            [(file_id, e["location"], e["text"], e.get("page"), e.get("sheet"), e.get("row"),
-                              e.get("paragraph"), e.get("slide"))
-                             for e in entries],
-                        )
-
-                if stale:
+        if stale:
+            with self._lock:
+                con = _connect()
+                try:
                     # SQLite 파라미터 개수 제한(기본 999)을 피하려고 묶어서 지운다.
                     # content_entries 는 FK ON DELETE CASCADE 로 같이 정리된다.
                     CHUNK = 500
@@ -536,11 +647,19 @@ class Indexer:
                         chunk = stale[i:i + CHUNK]
                         placeholders = ",".join("?" * len(chunk))
                         con.execute(f"DELETE FROM files WHERE path_norm IN ({placeholders})", chunk)
-                    for p in stale:
-                        self._meta.pop(p, None)
-                con.commit()
-            finally:
-                con.close()
+                    con.commit()
+                finally:
+                    con.close()
+                # self._meta 딕셔너리 크기를 바꾸는 작업이라 락 밖에서 하면 안 된다 —
+                # 다른 스레드(메인 스레드의 file_count() 등)가 그 사이에 self._meta를
+                # 락 잡고 순회 중이면 "dictionary changed size during iteration"
+                # RuntimeError가 날 수 있다(실측은 못 했지만 코드 경합 자체는 명백함).
+                for p in stale:
+                    self._meta.pop(p, None)
+
+        if stale:
+            changed[0] = True
+        return changed[0]
 
     # ---------- 검색 ----------
     def search(self, query: str, limit: int = MAX_RESULTS,
@@ -563,6 +682,14 @@ class Indexer:
         if not terms:
             return []
         results = []
+
+        # 화면에 보여줄 개수(limit, 설정의 search_display_limit에서 옴)보다
+        # 넉넉하게 잡는다 — 폴더 범위 필터링/내용-파일명 중복 제거를 거치면서
+        # 후보 중 일부가 최종 결과에서 빠지기 때문에, SQL LIMIT을 limit과
+        # 똑같이 걸면 필터링 후 실제 표시 개수가 모자랄 수 있다. 50000은
+        # 사용자가 설정에서 극단적으로 큰 값을 넣어도 한 번에 너무 많이
+        # 긁어오지 않도록 두는 안전판일 뿐, 평소엔 걸릴 일이 없다.
+        sql_limit = min(50000, max(limit * 4, 1000))
 
         allowed_norm = None
         if folder_modes is not None:
@@ -589,7 +716,7 @@ class Indexer:
             # ---- 폴더명 매칭: filename_only 폴더에서만, 폴더 자체를 결과로 보여준다 ----
             dir_rows = _term_search_sql(
                 "files", "name", "files_fts", "t.path, t.path_norm, t.name",
-                con, terms, extra_where="t.is_dir = 1",
+                con, terms, extra_where="t.is_dir = 1", sql_limit=sql_limit,
             )
             for path, path_norm, name in dir_rows:
                 matches = _matched_folders(path_norm)
@@ -610,12 +737,12 @@ class Indexer:
             # ---- 파일명 후보 ----
             name_rows = _term_search_sql(
                 "files", "name", "files_fts", "t.path, t.path_norm, t.name",
-                con, terms, extra_where="t.is_dir = 0",
+                con, terms, extra_where="t.is_dir = 0", sql_limit=sql_limit,
             )
             name_hits = {path: (path_norm, name) for path, path_norm, name in name_rows}
 
             # ---- 내용 후보 (page/sheet/row 컬럼이 실제 SQL 컬럼이라 인덱스를 탄다) ----
-            content_rows = _content_search_sql(con, terms)
+            content_rows = _content_search_sql(con, terms, sql_limit=sql_limit)
         finally:
             con.close()
 

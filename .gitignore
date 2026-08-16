@@ -6,5 +6,9 @@ installer_output/
 release_assets/
 *.spec
 
+# 콘솔 없이 실행하며 표준출력/에러를 파일로 돌려볼 때 생기는 로그
+app_log_run.txt
+app_log_err.txt
+
 # 개인 테스트/업무용 폴더 - 공개 저장소에 올리면 안 되는 실제 파일이 들어있음
 검색자료/
