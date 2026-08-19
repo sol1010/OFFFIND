@@ -13,7 +13,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QLabel, QToolButton,
     QListWidget, QListWidgetItem, QFrame, QSizePolicy, QPushButton,
-    QStyle, QStyledItemDelegate, QMenu, QApplication,
+    QStyle, QStyledItemDelegate, QMenu, QApplication, QScrollArea,
 )
 
 import win_focus
@@ -28,7 +28,11 @@ from search_worker import SearchWorker
 # — 좌표상 정확히 맞닿게 배치해도 이음매에 미세한 픽셀 어긋남이 보일 수 있어서(실측
 # 확인), 팝업을 이만큼 입력창 쪽으로 살짝 겹치게 그린다(같은 배경색이라 겹쳐도 티 안 남).
 SEAM_OVERLAP = 1
-FOLDER_ARROW_WIDTH = 26
+# 폴더 칩 스트립 아래에 항상 이만큼 공간을 잡아 둔다 — 칩이 넘칠 때만 나타나는
+# 가로 스크롤바가 이 안에 그려진다. 필요할 때만 높이를 늘리면 스크롤바가
+# 생겼다 사라질 때마다 창 높이가 들썩인다(창은 아래 기준으로 떠 있어서 위로
+# 튀어 보인다).
+CHIP_SCROLLBAR_RESERVE = 7
 MIN_QUERY_LENGTH = 2  # 한두 글자로는(특히 영문 한 글자) 결과가 너무 많아져 검색창이 멈춘 것처럼 느려짐
 # 결과 표시 개수 상한은 설정(settings.search_display_limit)에서 조절한다 —
 # _group_results()로 정렬/그룹핑하고 QListWidgetItem을 이 개수만큼 미리 다 만드는
@@ -280,17 +284,28 @@ STYLE = """
     background-color: rgba(138, 180, 248, 50);
     color: #e8eaed;
 }
-#folderPageArrow {
-    background-color: rgba(255, 255, 255, 14);
-    color: #9aa0a6;
+#folderScroll {
+    background: transparent;
     border: none;
-    border-radius: 10px;
-    padding: 3px 8px;
-    font-size: 11px;
 }
-#folderPageArrow:hover {
-    background-color: rgba(255, 255, 255, 28);
-    color: #e8eaed;
+#folderScroll QScrollBar:horizontal {
+    background: transparent;
+    height: 6px;
+    margin: 0;
+}
+#folderScroll QScrollBar::handle:horizontal {
+    background: rgba(255, 255, 255, 45);
+    border-radius: 3px;
+    min-width: 24px;
+}
+#folderScroll QScrollBar::handle:horizontal:hover {
+    background: rgba(255, 255, 255, 80);
+}
+#folderScroll QScrollBar::add-line:horizontal, #folderScroll QScrollBar::sub-line:horizontal {
+    width: 0px;
+}
+#folderScroll QScrollBar::add-page:horizontal, #folderScroll QScrollBar::sub-page:horizontal {
+    background: transparent;
 }
 """
 
@@ -664,6 +679,101 @@ class ResultsListWidget(QListWidget):
         super().mouseMoveEvent(event)
 
 
+class ChipScrollArea(QScrollArea):
+    """폴더 칩 한 줄짜리 가로 스크롤 스트립. 세로 휠을 가로 스크롤로 돌린다 —
+    QScrollArea 기본 동작은 세로 휠을 세로 스크롤바로만 보내는데, 이 스트립엔
+    세로 스크롤이 없어서 휠이 그냥 죽는다(칩 위에서 휠을 굴려도 아무 일도 안
+    일어남). 한 줄뿐이니 세로 휠 = 가로 이동으로 해석하는 게 자연스럽다."""
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y() or event.angleDelta().x()
+        bar = self.horizontalScrollBar()
+        bar.setValue(bar.value() - delta)
+        event.accept()
+
+
+class FolderChipButton(QPushButton):
+    """하단 폴더 칩 하나. 클릭은 켜기/끄기 토글, 좌우로 끌면 순서 변경.
+
+    끌기 시작 전까지는 일반 버튼과 똑같다. 누른 지점에서 startDragDistance
+    이상 움직이면 그때부터 순서 변경 모드 — 레이아웃 안에서 자기 위치를
+    실시간으로 옮겨 미리보기처럼 보여주고, 놓는 순간 새 순서를 저장한다
+    (on_reordered 콜백). 순서 변경으로 끝난 드래그는 클릭으로 치지 않는다 —
+    super().mouseReleaseEvent를 안 불러서 놓는 순간 토글이 같이 일어나는 걸
+    막는다."""
+
+    def __init__(self, folder_key: str, host_layout, scroll_area, on_reordered, parent=None):
+        super().__init__(parent)
+        self.folder_key = folder_key
+        self._host_layout = host_layout
+        self._scroll_area = scroll_area
+        self._on_reordered = on_reordered
+        self._press_pos = None
+        self._dragging = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.globalPosition().toPoint()
+            self._dragging = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._press_pos is not None and (event.buttons() & Qt.LeftButton):
+            gp = event.globalPosition().toPoint()
+            if (not self._dragging
+                    and (gp - self._press_pos).manhattanLength() >= QApplication.startDragDistance()):
+                self._dragging = True
+            if self._dragging:
+                self._drag_to(gp)
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging and event.button() == Qt.LeftButton:
+            self._dragging = False
+            self._press_pos = None
+            self.setDown(False)
+            self._on_reordered()
+            event.accept()
+            return
+        self._press_pos = None
+        super().mouseReleaseEvent(event)
+
+    def _chips(self):
+        chips = []
+        for i in range(self._host_layout.count()):
+            w = self._host_layout.itemAt(i).widget()
+            if isinstance(w, FolderChipButton):
+                chips.append(w)
+        return chips
+
+    def _drag_to(self, global_pos):
+        host = self.parentWidget()
+        x = host.mapFromGlobal(global_pos).x()
+
+        # 커서가 지나친 다른 칩 개수 = 목표 인덱스. 자기 자신은 빼고 세야
+        # 이동 후에도 인덱스 계산이 흔들리지 않는다.
+        chips = self._chips()
+        my_idx = chips.index(self)
+        others = [w for w in chips if w is not self]
+        target = sum(1 for w in others if x > w.x() + w.width() / 2)
+        if target != my_idx:
+            # 칩들은 항상 레이아웃 맨 앞에 연속으로 있고 그 뒤가 스트레치라,
+            # 칩 기준 인덱스를 레이아웃 인덱스로 그대로 써도 된다.
+            self._host_layout.removeWidget(self)
+            self._host_layout.insertWidget(target, self)
+
+        # 뷰포트 가장자리 근처로 끌면 보이지 않는 칩 쪽으로 자동 스크롤.
+        vp = self._scroll_area.viewport()
+        vx = vp.mapFromGlobal(global_pos).x()
+        bar = self._scroll_area.horizontalScrollBar()
+        if vx < 24:
+            bar.setValue(bar.value() - 12)
+        elif vx > vp.width() - 24:
+            bar.setValue(bar.value() + 12)
+
+
 class DraggableRow(QFrame):
     """검색창 이동용 핸들. line_edit/settings_btn 등 자식 위젯 위에서는
     클릭이 먼저 그 위젯으로 가므로, 이 프레임 자신의 빈 배경을 눌렀을 때만
@@ -857,8 +967,6 @@ class SearchWindow(QWidget):
         self._truncated = False
         self._folder_row_shown = False
         self._folder_chip_specs = []
-        self._folder_pages = [[]]
-        self._folder_chip_page = 0
         self._collapsed_categories = set()  # {(folder_label, member_label, category_label), ...}
         self._collapsed_folders = set()  # {folder_label, ...}
         self._collapsed_members = set()  # {(folder_label, member_label), ...}
@@ -961,15 +1069,36 @@ class SearchWindow(QWidget):
 
         card_layout.addWidget(input_row)
 
-        # 이 줄도 입력 줄과 같은 이유로 고정 높이 대신 내용(칩 버튼들)이 필요로
-        # 하는 만큼 레이아웃이 알아서 정하게 한다.
+        # 폴더 칩 줄 — 칩이 창 너비를 넘치면 페이지로 나누는 대신(예전 방식,
+        # ▶ 버튼으로 순환) 한 줄 그대로 두고 가로 스크롤한다. 칩은 끌어서 순서를
+        # 바꿀 수 있다(FolderChipButton).
         self.folder_row = QFrame(self.card)
         self.folder_row.setObjectName("folderRow")
         self.folder_row.setAttribute(Qt.WA_StyledBackground, True)
         self.folder_row.setVisible(False)
-        self.folder_row_layout = QHBoxLayout(self.folder_row)
-        self.folder_row_layout.setContentsMargins(16, 2, 16, 8)
+        folder_row_outer = QHBoxLayout(self.folder_row)
+        # 아래 여백은 스크롤바 예약 공간(CHIP_SCROLLBAR_RESERVE)이 대신한다 —
+        # 스크롤바가 안 보일 땐 그 공간이 그대로 여백처럼 보인다.
+        folder_row_outer.setContentsMargins(16, 2, 16, 2)
+        folder_row_outer.setSpacing(0)
+
+        self.folder_scroll = ChipScrollArea(self.folder_row)
+        self.folder_scroll.setObjectName("folderScroll")
+        self.folder_scroll.setFrameShape(QFrame.NoFrame)
+        self.folder_scroll.setWidgetResizable(True)
+        self.folder_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.folder_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # QScrollArea 뷰포트는 기본적으로 자기 배경(회색)을 칠한다 — 카드의 어두운
+        # 배경이 그대로 비치도록 꺼준다.
+        self.folder_scroll.viewport().setAutoFillBackground(False)
+
+        self.chips_host = QWidget()
+        self.chips_host.setAutoFillBackground(False)
+        self.folder_row_layout = QHBoxLayout(self.chips_host)
+        self.folder_row_layout.setContentsMargins(0, 0, 0, 0)
         self.folder_row_layout.setSpacing(6)
+        self.folder_scroll.setWidget(self.chips_host)
+        folder_row_outer.addWidget(self.folder_scroll)
         card_layout.addWidget(self.folder_row)
 
         # 좌우 가장자리 리사이즈 핸들. card의 자식이 아니라 self(최상위 창)의
@@ -1038,16 +1167,14 @@ class SearchWindow(QWidget):
         screen_w = screen.availableGeometry().width()
         self.settings.width_percent = round(self.width() / screen_w, 4)
         self.settings.save()
-        # 칩이 새 너비에 맞게 다시 줄바꿈/페이지 나뉨 되도록 갱신.
-        self._compute_folder_pages()
-        self._folder_chip_page = 0
-        self._render_folder_chip_page()
+        # 칩 줄은 가로 스크롤 스트립이라 새 너비에 맞춰 알아서 따라온다 —
+        # 예전 페이지 방식처럼 다시 나눠 그릴 필요가 없다.
         self._resize_to_fit()
 
     def _rebuild_folder_chips(self):
         """옵션에서 폴더 목록이 바뀔 때마다(혹은 창을 다시 열 때) 하단 토글 칩을
-        다시 만든다. 칩이 창 너비를 넘치면 페이지로 나누고, 오른쪽 끝에 화살표를
-        붙여 다음 페이지로 순환할 수 있게 한다(전부 다 보여주려다 잘리는 대신)."""
+        다시 만든다. 칩이 창 너비를 넘치면 가로 스크롤로 본다(휠 또는 스크롤바 —
+        예전의 페이지 나누기 + ▶ 순환 방식은 폐기)."""
         folders = self.settings.folders
         # 표시 이름은 최상위 폴더/그룹 키뿐 아니라 그룹 안에 숨은 멤버 폴더에도
         # 붙는다(settings.folders에는 그룹 키만 있고 멤버 경로는 folder_groups
@@ -1078,55 +1205,21 @@ class SearchWindow(QWidget):
 
         self._folder_row_shown = bool(folders)
         self.folder_row.setVisible(self._folder_row_shown)
-        self._compute_folder_pages()
-        self._folder_chip_page = 0
-        self._render_folder_chip_page()
+        self._folder_chip_specs = [(f, self._chip_label(f)) for f in folders]
+        self._render_folder_chips()
 
     def _chip_label(self, folder: str) -> str:
         return self._folder_display_name(folder)
 
-    def _chip_width(self, label: str) -> int:
+    def _chip_height(self) -> int:
         # 버튼을 실제로 만들어 sizeHint()를 읽으면(아직 화면에 붙기 전이라) QSS의
         # font-size가 반영 안 된 값이 나올 수 있어(전에 겪었던 문제), 직접 폰트를
-        # 지정해 폭을 추정한다 — 페이지를 나누는 데는 이 정도 정확도면 충분하다.
+        # 지정해 높이를 추정한다 — QSS 상하 padding(4+4)에 여유 1px.
         font = QFont()
         font.setPixelSize(11)
-        return QFontMetrics(font).horizontalAdvance(label) + 24  # 좌우 padding(10+10)+여유
+        return QFontMetrics(font).height() + 9
 
-    def _compute_folder_pages(self):
-        folders = self.settings.folders
-        self._folder_chip_specs = [(f, self._chip_label(f)) for f in folders]
-        if not self._folder_chip_specs:
-            self._folder_pages = [[]]
-            return
-
-        spacing = 6
-        margins = 16 + 16
-        available = max(60, self.width() - margins)
-        widths = [self._chip_width(label) for _, label in self._folder_chip_specs]
-
-        total = sum(widths) + spacing * (len(widths) - 1)
-        if total <= available:
-            self._folder_pages = [list(range(len(widths)))]
-            return
-
-        arrow_reserve = FOLDER_ARROW_WIDTH + spacing
-        avail_per_page = max(60, available - arrow_reserve)
-        pages = []
-        current, current_w = [], 0
-        for i, w in enumerate(widths):
-            add = w + (spacing if current else 0)
-            if current and current_w + add > avail_per_page:
-                pages.append(current)
-                current, current_w = [], 0
-                add = w
-            current.append(i)
-            current_w += add
-        if current:
-            pages.append(current)
-        self._folder_pages = pages
-
-    def _render_folder_chip_page(self, resize: bool = True):
+    def _render_folder_chips(self, resize: bool = True):
         while self.folder_row_layout.count():
             item = self.folder_row_layout.takeAt(0)
             w = item.widget()
@@ -1140,12 +1233,19 @@ class SearchWindow(QWidget):
         if not self._folder_chip_specs:
             return
 
-        pages = self._folder_pages
-        self._folder_chip_page = max(0, min(self._folder_chip_page, len(pages) - 1))
-        for i in pages[self._folder_chip_page]:
-            f, label = self._folder_chip_specs[i]
-            btn = QPushButton(label, self.folder_row)
+        chip_h = self._chip_height()
+        # 칩 높이 + 스크롤바 예약 공간으로 고정한다 — 레이아웃 sizeHint에 맡기면
+        # 재렌더 직후 잠깐 엉뚱한 값이 잡혀 창이 들썩이는 문제가 있었다(예전
+        # _base_height 관련 주석 참고). 칩이 넘칠 때만 나타나는 스크롤바도 이
+        # 예약 공간 안에 그려져서 높이가 변하지 않는다.
+        self.folder_scroll.setFixedHeight(chip_h + CHIP_SCROLLBAR_RESERVE)
+
+        for f, label in self._folder_chip_specs:
+            btn = FolderChipButton(f, self.folder_row_layout, self.folder_scroll,
+                                   self._on_chips_reordered, self.chips_host)
+            btn.setText(label)
             btn.setObjectName("folderChip")
+            btn.setFixedHeight(chip_h)
             # 체크 가능한 버튼이 네이티브(Windows) 스타일의 체크박스 표시를 글자
             # 앞에 그려 넣는데, 전역 스타일시트의 "::indicator" 규칙만으로는 이
             # 네이티브 표시가 안 사라지는 경우가 있었다(실측으로 확인함) — 버튼
@@ -1170,16 +1270,11 @@ class SearchWindow(QWidget):
             else:
                 btn.setToolTip("")
             btn.toggled.connect(lambda checked, folder=f: self._on_chip_toggled(folder, checked))
-            self.folder_row_layout.addWidget(btn)
+            # 칩을 위쪽에 붙인다 — 세로 가운데 정렬로 두면 스크롤바가 생기고
+            # 사라질 때마다(뷰포트 높이가 6px 변함) 칩이 위아래로 미세하게
+            # 움직여 보인다.
+            self.folder_row_layout.addWidget(btn, 0, Qt.AlignTop)
         self.folder_row_layout.addStretch(1)
-
-        if len(pages) > 1:
-            arrow = QPushButton("▶", self.folder_row)
-            arrow.setObjectName("folderPageArrow")
-            arrow.setCursor(Qt.PointingHandCursor)
-            arrow.setToolTip(f"다음 폴더 목록 ({self._folder_chip_page + 1}/{len(pages)})")
-            arrow.clicked.connect(self._next_folder_page)
-            self.folder_row_layout.addWidget(arrow)
 
         # 색인 진행 상황이 연달아 들어오면(set_indexing_paths) 이 함수가 짧은
         # 시간 안에 여러 번 다시 불리는데, 그때 sizeHint()를 다시 재면 방금 새로
@@ -1187,16 +1282,27 @@ class SearchWindow(QWidget):
         # 훨씬 작은 값(예: 31 대신 10)이 나올 때가 있었다(activate()를 걸어도
         # 안 잡힘 — 실측으로 확인함). 그러면 _base_height()가 줄어들어서
         # 검색창이 그만큼 아래로 내려가 보인다. 색인 아이콘만 바뀌는 경우엔
-        # 칩 구성(개수·페이지)이 그대로라 줄 높이도 원래 안 바뀌어야 정상이니,
-        # 그 경로(resize=False)에서는 아예 다시 배치를 안 한다.
+        # 칩 구성이 그대로라 줄 높이도 원래 안 바뀌어야 정상이니, 그 경로
+        # (resize=False)에서는 아예 다시 배치를 안 한다.
         if resize and self.isVisible():
             self._resize_to_fit()
 
-    def _next_folder_page(self):
-        if len(self._folder_pages) <= 1:
+    def _on_chips_reordered(self):
+        """칩을 끌어놓아 순서가 바뀌었을 때 — 레이아웃의 현재 순서를 설정에
+        저장한다. 결과 묶음 순서 = 칩 순서이므로, 결과가 떠 있으면 그것도 새
+        순서로 다시 그린다."""
+        order = []
+        for i in range(self.folder_row_layout.count()):
+            w = self.folder_row_layout.itemAt(i).widget()
+            if isinstance(w, FolderChipButton):
+                order.append(w.folder_key)
+        if order == self.settings.folders:
             return
-        self._folder_chip_page = (self._folder_chip_page + 1) % len(self._folder_pages)
-        self._render_folder_chip_page()
+        self.settings.folders = order
+        self.settings.save()
+        self._folder_chip_specs = [(f, self._chip_label(f)) for f in order]
+        if self._results:
+            self._render_results()
 
     def _on_chip_toggled(self, folder: str, checked: bool):
         self.settings.folder_enabled[folder] = checked
@@ -1422,13 +1528,9 @@ class SearchWindow(QWidget):
         self._max_total_height = int(geo.height() * self.settings.max_height_percent)
 
         self.setFixedWidth(width)
-        # 폴더 칩 페이지는 실제 창 너비를 기준으로 나누는데, 맨 처음(__init__
-        # 시점)에는 창 크기가 아직 정해지기 전이라 정확하지 않을 수 있다 —
-        # 창을 열 때마다 지금 너비 기준으로 다시 계산한다.
-        self._compute_folder_pages()
-        self._folder_chip_page = 0
-        self._render_folder_chip_page()
-        # base는 위에서(_render_folder_chip_page 전에) 한 번 구했는데, 그건
+        # 칩 줄은 가로 스크롤 스트립이라 창 너비와 무관하게 이미 그려져 있다 —
+        # 예전 페이지 방식처럼 열 때마다 다시 나눠 그릴 필요가 없다.
+        # base는 위에서 한 번 구했는데, 그건
         # 화면 안으로 bottom_y를 보정하는 용도로만 쓴 것이고, 실제 창 위치를
         # 정할 땐 폴더 칩 줄이 최종적으로 어떻게 그려졌는지(_folder_row_shown이
         # 색인 중 표시 등으로 이 함수 안에서 바뀔 수 있다) 반영해서 다시 구해야
@@ -1608,10 +1710,10 @@ class SearchWindow(QWidget):
         self._indexing_paths = path_norms
         if not path_norms:
             self._folder_progress.clear()
-        # 아이콘만 바뀌는 거라 칩 구성 자체(개수·페이지)는 그대로다 — 창을 다시
-        # 배치할 필요가 없다(resize=False, 관련 버그는 _render_folder_chip_page
+        # 아이콘만 바뀌는 거라 칩 구성 자체(개수)는 그대로다 — 창을 다시
+        # 배치할 필요가 없다(resize=False, 관련 버그는 _render_folder_chips
         # 주석 참고).
-        self._render_folder_chip_page(resize=False)
+        self._render_folder_chips(resize=False)
         if path_norms:
             if not self._spinner_timer.isActive():
                 self._spinner_timer.start()
@@ -1639,12 +1741,12 @@ class SearchWindow(QWidget):
     def set_folder_progress(self, path_norm: str, found: int, total: int):
         """path_norm 폴더 하나의 진행 상황(찾은 개수/기준 총량 — 지난번 색인 때
         그 폴더 밑에 있던 파일 수를 어림값으로 씀). 툴팁의 퍼센트 표시에만 쓴다.
-        칩 구성(개수·페이지)은 안 바뀌니 재배치도 필요 없다(set_indexing_paths와
+        칩 구성(개수)은 안 바뀌니 재배치도 필요 없다(set_indexing_paths와
         같은 이유 — 재배치를 시도하면 창이 뜬 직후 진행률 신호가 들어오면서
         아래로 내려가 보이는 문제가 있었다)."""
         self._folder_progress[path_norm] = (found, total)
         if self.isVisible():
-            self._render_folder_chip_page(resize=False)
+            self._render_folder_chips(resize=False)
 
     def _folder_progress_percent(self, folder: str):
         members = self.settings.folder_groups.get(folder)
