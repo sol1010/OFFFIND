@@ -689,7 +689,7 @@ class FolderChipButton(QPushButton):
         self._on_reordered = on_reordered
         self._press_pos = None       # 전역 좌표 — 드래그 시작 판정용
         self._press_local_x = 0      # 칩 안에서 누른 x — 끌 때 커서가 칩의 그 지점을 계속 잡고 있게
-        self._dragging = False
+        self.dragging = False        # 창 쪽(_render_folder_chips)이 재렌더를 미룰지 판단할 때도 읽는다
         self._placeholder = None
         self._drag_y = 0
 
@@ -697,23 +697,23 @@ class FolderChipButton(QPushButton):
         if event.button() == Qt.LeftButton:
             self._press_pos = event.globalPosition().toPoint()
             self._press_local_x = event.position().toPoint().x()
-            self._dragging = False
+            self.dragging = False
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self._press_pos is not None and (event.buttons() & Qt.LeftButton):
             gp = event.globalPosition().toPoint()
-            if (not self._dragging
+            if (not self.dragging
                     and (gp - self._press_pos).manhattanLength() >= QApplication.startDragDistance()):
                 self._begin_drag()
-            if self._dragging:
+            if self.dragging:
                 self._drag_to(gp)
                 event.accept()
                 return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if self._dragging and event.button() == Qt.LeftButton:
+        if self.dragging and event.button() == Qt.LeftButton:
             self._end_drag()
             event.accept()
             return
@@ -729,7 +729,7 @@ class FolderChipButton(QPushButton):
         return chips
 
     def _begin_drag(self):
-        self._dragging = True
+        self.dragging = True
         self._drag_y = self.y()  # 세로는 이 값에 고정 — 좌우로만 끌린다
         idx = self._chips().index(self)
         self._host_layout.removeWidget(self)
@@ -762,7 +762,7 @@ class FolderChipButton(QPushButton):
             bar.setValue(bar.value() + 12)
 
     def _end_drag(self):
-        self._dragging = False
+        self.dragging = False
         self._press_pos = None
         idx = self._host_layout.indexOf(self._placeholder)
         self._host_layout.removeWidget(self._placeholder)
@@ -1219,6 +1219,20 @@ class SearchWindow(QWidget):
         return QFontMetrics(font).height() + 9
 
     def _render_folder_chips(self, resize: bool = True):
+        # 칩을 끌고 있는 도중에는 절대 다시 그리지 않는다 — 백그라운드 색인의
+        # 진행 신호(set_indexing_paths/set_folder_progress)가 드래그 중에 들어와
+        # 재렌더가 돌면, 끌고 있는 칩은 레이아웃 밖에 있어서 안 지워지고 자리표시자·
+        # 다른 칩들만 삭제된다. 그 뒤 드래그 코드가 이미 삭제된 자리표시자를 계속
+        # 만지다가 파이썬 예외도 없이 통째로 죽을 수 있다(네이티브 크래시 — 앱이
+        # 소리 없이 꺼진 원인으로 추정). 스피너 아이콘 갱신은 드래그가 끝난 다음
+        # 렌더에서 따라잡으면 된다.
+        #
+        # 주의: 끌리는 칩 자신은 드래그 동안 레이아웃 밖에 있으므로(레이아웃을
+        # 순회하면 못 찾는다) 부모 위젯의 자식 목록에서 찾아야 한다.
+        for w in self.chips_host.findChildren(FolderChipButton):
+            if w.dragging:
+                return
+
         while self.folder_row_layout.count():
             item = self.folder_row_layout.takeAt(0)
             w = item.widget()

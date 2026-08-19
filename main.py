@@ -3,9 +3,22 @@
 폴더 안의 엑셀(xlsx/xlsm) · PDF 파일 내용을 검색하는 항상-실행형 트레이 앱.
 전역 단축키(기본 ctrl+alt+space)로 검색창을 열고 닫는다.
 """
+import faulthandler
 import os
 import sys
 import time
+
+# 네이티브 크래시(파이썬 예외 없이 즉사)가 나면 어디서 죽었는지 스택이라도 남게
+# 한다 — 실제로 앱이 아무 트레이스백 없이 꺼진 적이 있는데, 이게 없으면 원인
+# 추적이 불가능하다. 크래시 시점의 각 스레드 스택이 이 파일에 기록된다.
+# (pythonw로 띄우면 sys.stderr가 없어서 enable()이 실패하므로 파일로 직접 받는다.)
+try:
+    _crash_dir = os.path.join(os.environ.get("APPDATA", "."), "OFFFIND")
+    os.makedirs(_crash_dir, exist_ok=True)
+    _crash_log = open(os.path.join(_crash_dir, "crash.log"), "a")
+    faulthandler.enable(file=_crash_log)
+except OSError:
+    pass
 
 from PySide6.QtCore import QThread, QTimer
 from PySide6.QtGui import QIcon
