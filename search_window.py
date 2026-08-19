@@ -331,10 +331,24 @@ def _char_cap(lines: int, font_px: int) -> int:
     return per_line * max(1, lines)
 
 
-def _cap_text(text: str, char_cap: int) -> str:
+def _cap_text_keep_match(text: str, char_cap: int, terms) -> str:
+    """스니펫을 표시 한도까지 자르되, 검색어가 잘려나가지 않게 한다.
+
+    앞에서부터 무조건 자르면(예전 동작) 매치 지점이 한도 밖에 있는 스니펫은
+    검색어 없는 문맥만 보여서 "강조가 하나도 없는 결과"처럼 보였다 — 그런
+    경우엔 자르는 창을 첫 매치 위치 쪽으로 옮긴다(앞 문맥 1/3, 뒤 2/3)."""
     if len(text) <= char_cap:
         return text
-    return text[:char_cap].rstrip() + "…"
+    lower = text.lower()
+    hits = [i for i in (lower.find(t) for t in terms if t) if i != -1]
+    first = min(hits) if hits else -1
+    if first == -1 or first < char_cap - 4:
+        return text[:char_cap].rstrip() + "…"
+    start = max(0, first - char_cap // 3)
+    capped = "…" + text[start:start + char_cap].strip()
+    if start + char_cap < len(text):
+        capped += "…"
+    return capped
 
 
 def _px_font(px: int, weight: QFont.Weight = QFont.Normal) -> QFont:
@@ -529,7 +543,9 @@ class ResultDelegate(QStyledItemDelegate):
 
         if result.get("snippet"):
             snippet_rect = QRect(left, next_top, right - left, self._snippet_block_h)
-            self._draw_snippet(painter, snippet_rect, _cap_text(result["snippet"], self._snippet_char_cap))
+            self._draw_snippet(painter, snippet_rect,
+                               _cap_text_keep_match(result["snippet"], self._snippet_char_cap,
+                                                    self._highlight_terms))
 
     def _draw_snippet(self, painter, rect, text):
         """스니펫을 그린다. 검색어와 일치하는 부분은 배경을 칠해서 강조한다.

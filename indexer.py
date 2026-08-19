@@ -18,7 +18,12 @@ from config import CACHE_PATH, CACHE_DB_PATH
 from parsers import EXTRACTORS
 
 MAX_RESULTS = 5000  # 결과 목록이 가상화되어 있어(보이는 행만 그림) 이 정도는 가볍게 처리된다
-SNIPPET_RADIUS = 220
+# 스니펫에서 매치 지점 앞뒤로 보여줄 문맥 길이. 앞 문맥을 뒤보다 훨씬 짧게
+# 잡는다 — 화면(델리게이트)은 스니펫 앞에서부터 줄 수 제한(기본 3줄 ≈ 180자)까지만
+# 그리기 때문에, 앞 문맥이 표시 한도보다 길면 정작 검색어가 들어간 부분이 화면
+# 밖으로 잘려서 "강조가 하나도 없는 결과"처럼 보인다(실제로 그렇게 보여서 발견함).
+SNIPPET_PREFIX = 50
+SNIPPET_SUFFIX = 390
 MAX_SNIPPET_LEN = 480
 
 # 트리거/FTS5 가상 테이블을 만들기 "전에" 원본 테이블에 대량으로 넣어야 하는 경우가
@@ -890,8 +895,8 @@ class Indexer:
             if not all(t in text_lower for t in terms):
                 continue  # FTS 후보에는 들어왔지만 실제로 전부 포함은 아닐 수 있어 다시 확인
             idx = text_lower.find(terms[0])
-            start = max(0, idx - SNIPPET_RADIUS)
-            end = min(len(text), idx + len(terms[0]) + SNIPPET_RADIUS, start + MAX_SNIPPET_LEN)
+            start = max(0, idx - SNIPPET_PREFIX)
+            end = min(len(text), idx + len(terms[0]) + SNIPPET_SUFFIX, start + MAX_SNIPPET_LEN)
             snippet = text[start:end]
             if start > 0:
                 snippet = "…" + snippet
