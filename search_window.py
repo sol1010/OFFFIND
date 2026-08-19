@@ -1008,6 +1008,15 @@ class SearchWindow(QWidget):
         self.line_edit.installEventFilter(self)
         QShortcut(QKeySequence(Qt.Key_Escape), self, activated=self.hide_window)
 
+        # 좌우 방향키의 주인: 처음엔 입력창(텍스트 커서 이동)이고, 결과 목록을
+        # 클릭하거나 위/아래로 이동하면 결과 조작(카테고리 접기/펼치기)으로
+        # 넘어간다. 입력창을 다시 클릭하거나 글자를 고치면 텍스트 커서로 복귀.
+        # 예전엔 좌우가 무조건 결과 조작에 뺏겨서 검색어 중간을 고치려면
+        # 마우스로 클릭하는 수밖에 없었다.
+        self._results_nav_active = False
+        self.results_list.itemPressed.connect(lambda *_: self._set_results_nav(True))
+        self.line_edit.textChanged.connect(lambda _: self._set_results_nav(False))
+
     # ---------- UI 구성 ----------
     def _build_ui(self):
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -1558,6 +1567,7 @@ class SearchWindow(QWidget):
         self.line_edit.setFocus(Qt.ActiveWindowFocusReason)
         self._resize_to_fit()
         self.line_edit.selectAll()
+        self._set_results_nav(False)  # 열 때는 항상 텍스트 커서 모드부터
 
     def hide_window(self):
         self.hide()
@@ -1579,18 +1589,28 @@ class SearchWindow(QWidget):
         self.settings.pos_bottom_y = self._bottom_y
         self.settings.save()
 
+    def _set_results_nav(self, active: bool):
+        self._results_nav_active = active
+
     def eventFilter(self, obj, event):
+        if obj is self.line_edit and event.type() == QEvent.MouseButtonPress:
+            # 입력창을 직접 누르면 좌우 방향키를 텍스트 커서 이동으로 되돌린다.
+            self._set_results_nav(False)
+            return False  # 클릭 자체(커서 위치 지정)는 평소대로 처리되게 둔다
         if obj is self.line_edit and event.type() == QEvent.KeyPress:
             key = event.key()
             if key in (Qt.Key_Down, Qt.Key_Up):
+                self._set_results_nav(True)  # 결과를 훑기 시작 — 좌우도 결과 조작으로
                 self._move_selection(1 if key == Qt.Key_Down else -1)
                 return True
             if key in (Qt.Key_Return, Qt.Key_Enter):
                 self._open_selected()
                 return True
             if key in (Qt.Key_Left, Qt.Key_Right):
-                self._set_current_category_collapsed(key == Qt.Key_Left)
-                return True
+                if self._results_nav_active:
+                    self._set_current_category_collapsed(key == Qt.Key_Left)
+                    return True
+                return False  # 텍스트 모드 — QLineEdit 기본 동작(커서 이동)에 맡긴다
         return super().eventFilter(obj, event)
 
     def event(self, e):
