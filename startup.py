@@ -1,4 +1,5 @@
 """윈도우 시작프로그램 등록/해제 (레지스트리 Run 키 사용)."""
+import os
 import sys
 import winreg
 
@@ -10,8 +11,16 @@ _OLD_APP_NAMES = ["KS-Finder", "FileSearcher"]
 def _command() -> str:
     if getattr(sys, "frozen", False):
         return f'"{sys.executable}"'
+    # 지금 콘솔 버전(python.exe)으로 실행 중이더라도, 자동 시작 등록은 항상
+    # 콘솔 없는 pythonw.exe로 해 둔다 — 안 그러면 부팅할 때마다 검은 cmd 창이
+    # 같이 떠서 남는다.
+    exe = sys.executable
+    if os.path.basename(exe).lower() == "python.exe":
+        pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(pythonw):
+            exe = pythonw
     script = sys.argv[0]
-    return f'"{sys.executable}" "{script}"'
+    return f'"{exe}" "{script}"'
 
 
 def _migrate_old_registry_entry():
