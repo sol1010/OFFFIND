@@ -63,6 +63,19 @@ CREATE TABLE IF NOT EXISTS content_entries (
     slide INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_content_entries_file_id ON content_entries(file_id);
+
+-- 등록(경로 + 검색 방식)별 "최초 색인을 끝까지 마친 적이 있는가" 기록.
+-- 색인은 최초 색인과 그 이후의 (정기·비정기) 재색인으로 나뉘는데, 검색창의
+-- 로딩 표시는 최초 색인에만 붙는다(재색인은 이미 검색 가능한 색인이 있는 상태의
+-- 배경 갱신이라 표시하지 않는다) — 그 구분의 근거가 이 테이블이다. 설정 파일이
+-- 아니라 색인 DB에 두는 이유: 캐시 DB를 지우면 색인을 처음부터 다시 하게 되므로,
+-- 이 기록도 같이 사라져 "최초 색인"으로 돌아가는 게 맞다.
+CREATE TABLE IF NOT EXISTS indexed_roots (
+    path_norm TEXT NOT NULL,
+    filename_only INTEGER NOT NULL,
+    first_indexed_at REAL,
+    PRIMARY KEY (path_norm, filename_only)
+);
 """
 
 _CONTENT_ENTRIES_EXTRA_COLUMNS = {"paragraph": "INTEGER", "slide": "INTEGER"}
@@ -696,6 +709,10 @@ class Indexer:
             # 실제로 검색 가능한 상태가 된다(search()는 self._meta가 아니라 DB를
             # 직접 읽는다) — 폴더별 완료를 알리기 전에 먼저 flush.
             _flush()
+            # 이 등록의 최초 색인이 완료됐다고 기록한다(이미 기록돼 있으면 그대로).
+            # 취소되면 위의 cancel_check 에서 먼저 return 하므로 여기까지 못 온다 —
+            # 중간에 끊긴 최초 색인은 다음 실행에서 여전히 "최초"로 취급된다.
+            self._record_root_indexed(folder_norm, bool(filename_only))
             if folder_done:
                 folder_done(os.path.normcase(os.path.normpath(folder)), bool(filename_only))
 
@@ -935,3 +952,29 @@ class Indexer:
     def file_count(self) -> int:
         with self._lock:
             return sum(1 for _path, is_dir, *_rest in self._meta.values() if is_dir == 0)
+
+    # ---------- 최초 색인 여부 (indexed_roots) ----------
+    def indexed_registrations(self) -> set:
+        """최초 색인을 끝까지 마친 적이 있는 등록들 — {(path_norm, filename_only), ...}.
+        main.py 가 색인 라운드를 시작할 때 이 집합에 없는 등록만 '최초 색인'으로
+        보고 검색창에 로딩 표시를 붙인다."""
+        with self._lock:
+            con = _connect()
+            try:
+                return {(path_norm, bool(fo)) for path_norm, fo in
+                        con.execute("SELECT path_norm, filename_only FROM indexed_roots")}
+            finally:
+                con.close()
+
+    def _record_root_indexed(self, path_norm: str, filename_only: bool):
+        with self._lock:
+            con = _connect()
+            try:
+                con.execute(
+                    "INSERT OR IGNORE INTO indexed_roots (path_norm, filename_only, first_indexed_at) "
+                    "VALUES (?, ?, ?)",
+                    (path_norm, 1 if filename_only else 0, time.time()),
+                )
+                con.commit()
+            finally:
+                con.close()

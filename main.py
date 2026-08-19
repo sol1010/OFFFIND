@@ -149,12 +149,20 @@ class App:
         all_modes = selected_modes + rest_modes
         self._pending_all_modes = all_modes
 
-        # 이번 라운드에서 건드릴 폴더 전부(선택된 것 + 나머지)를 미리 "아직 안 끝남"
-        # 으로 표시해 둔다 — 안에서 폴더 하나하나 끝날 때마다(folder_done 시그널)
-        # 여기서 지워나간다. 파일명만 등록된 빠른 폴더가 뒤에 처리되는 무거운(내용
-        # 파싱) 폴더와 같은 배치에 있어도, 그 폴더 자체가 끝나면 바로 로딩 표시가
-        # 내려가야 하는데(그 전엔 배치 전체가 끝나야만 지워져서 안 지워지는 것처럼
-        # 보였다 — 실측으로 확인함), 그러려면 폴더별로 따로 추적해야 한다.
+        # 색인은 "최초 색인"과 그 이후의 "(정기·비정기) 재색인"으로 나뉜다.
+        #  - 최초 색인: 그 등록(경로 + 검색 방식)을 이 색인 DB에서 끝까지 훑은 적이
+        #    없음 — 아직 검색이 안 되는 상태라, 검색창 폴더 칩에 로딩 표시를 붙인다.
+        #  - 정기(5분 타이머)·비정기(창 열기, 수동 새로고침, 설정 변경) 재색인:
+        #    이미 검색 가능한 색인이 있는 상태의 배경 갱신 — 로딩 표시 없이 조용히
+        #    돈다(매번 칩마다 스피너가 돌면 "지금 검색이 안 되는 건가?"로 오해된다).
+        # 완료 기록은 색인 DB(indexed_roots)에 있어서 앱을 재시작해도 유지되고,
+        # 캐시 DB를 지우면 전부 다시 최초 색인으로 돌아간다.
+        #
+        # 로딩 표시 추적은 폴더 하나 끝날 때마다(folder_done 시그널) 지워나간다.
+        # 파일명만 등록된 빠른 폴더가 뒤에 처리되는 무거운(내용 파싱) 폴더와 같은
+        # 배치에 있어도, 그 폴더 자체가 끝나면 바로 로딩 표시가 내려가야 하는데
+        # (그 전엔 배치 전체가 끝나야만 지워져서 안 지워지는 것처럼 보였다 —
+        # 실측으로 확인함), 그러려면 폴더별로 따로 추적해야 한다.
         #
         # 추적 단위는 "경로"가 아니라 "등록"(경로 + 검색 방식)이다. 같은 폴더를
         # 파일명용·내용용으로 두 번 등록할 수 있는데, 경로만으로 세면 두 등록이
@@ -162,9 +170,12 @@ class App:
         # 만에 끝나도, 뒤로 밀린 내용 패스(정렬상 항상 마지막)가 끝날 때까지 두 칩이
         # 같이 돌아서 "속도 차이가 하나도 안 보이는" 문제가 있었다(실측으로 확인함).
         # 등록별로 세면 각 칩이 자기 패스가 끝나는 즉시 꺼진다.
+        done_registrations = self.indexer.indexed_registrations()
         self._active_indexing_counts = {}
         for path, fo in selected_modes + rest_modes:
             key = (os.path.normcase(os.path.normpath(path)), bool(fo))
+            if key in done_registrations:
+                continue  # 재색인 — 조용히 갱신하고 로딩 표시는 붙이지 않는다
             self._active_indexing_counts[key] = self._active_indexing_counts.get(key, 0) + 1
         self.search_window.set_indexing_paths(set(self._active_indexing_counts))
 
@@ -172,7 +183,7 @@ class App:
             self._worker = IndexWorker(self.indexer, selected_modes, all_folder_modes=all_modes)
             self._worker.progress.connect(self.search_window.on_index_progress)
             self._worker.folder_done.connect(self._on_folder_indexed)
-            self._worker.folder_progress.connect(self.search_window.set_folder_progress)
+            self._worker.folder_progress.connect(self._on_folder_progress)
             self._worker.finished_ok.connect(self._on_selected_indexing_finished)
             self.search_window.on_index_started()
             # 낮은 우선순위로 돌려서, 무거운 색인이 도는 동안에도 검색(다른 스레드)이
@@ -180,6 +191,13 @@ class App:
             self._worker.start(QThread.LowPriority)
         else:
             self._start_rest_indexing()
+
+    def _on_folder_progress(self, path_norm: str, found: int, total: int):
+        # 로딩 표시가 붙은(최초 색인 중인) 등록의 진행률만 검색창으로 넘긴다 —
+        # 조용히 도는 정기/비정기 재색인의 진행률까지 넘기면, 표시할 스피너도
+        # 없는데 칩 페이지만 배경 갱신 때마다 계속 다시 그려진다.
+        if any(k[0] == path_norm for k in self._active_indexing_counts):
+            self.search_window.set_folder_progress(path_norm, found, total)
 
     def _on_folder_indexed(self, path_norm: str, filename_only: bool):
         key = (path_norm, bool(filename_only))
@@ -206,7 +224,7 @@ class App:
             return
         self._worker = IndexWorker(self.indexer, rest_modes, all_folder_modes=self._pending_all_modes)
         self._worker.folder_done.connect(self._on_folder_indexed)
-        self._worker.folder_progress.connect(self.search_window.set_folder_progress)
+        self._worker.folder_progress.connect(self._on_folder_progress)
         self._worker.finished_ok.connect(lambda count, changed: self._on_index_finished(count, silent))
         self._worker.start(QThread.LowPriority)
 

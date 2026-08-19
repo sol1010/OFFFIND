@@ -219,6 +219,55 @@ def test_repeated_index_with_no_changes_reports_no_change(offfind, tmp_path):
     assert idx.rebuild(modes, all_folder_modes=modes) is False
 
 
+def _norm(p):
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
+def test_first_index_is_recorded_per_registration(offfind, tmp_path):
+    """최초 색인을 끝까지 마친 등록만 indexed_registrations() 에 나타난다 —
+    검색창 로딩 표시는 최초 색인에만 붙고, 이후의 (정기·비정기) 재색인은
+    조용히 돌아야 하므로 이 집합이 그 구분의 근거다."""
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "a.txt").write_text("x", encoding="utf-8")
+
+    idx = offfind.Indexer()
+    assert idx.indexed_registrations() == set()
+
+    idx.rebuild([(str(data), True)], all_folder_modes=[(str(data), True)])
+    assert idx.indexed_registrations() == {(_norm(data), True)}
+
+    # 같은 경로라도 검색 방식이 다르면 별도 등록이다 — 파일명 등록이 끝났다고
+    # 내용 등록(아직 최초 색인 전)까지 조용히 돌면, 새로 켠 내용 색인이 몇 분씩
+    # 걸리는 동안 아무 표시가 없게 된다.
+    idx.rebuild([(str(data), False)], all_folder_modes=[(str(data), False)])
+    assert idx.indexed_registrations() == {(_norm(data), True), (_norm(data), False)}
+
+
+def test_cancelled_first_index_is_not_recorded(offfind, tmp_path):
+    """중간에 취소된(앱 종료 등) 최초 색인은 완료로 기록되면 안 된다 — 기록되면
+    다음 실행에서 아직 검색도 안 되는 폴더가 로딩 표시 없이 조용히 색인된다."""
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "a.txt").write_text("x", encoding="utf-8")
+
+    idx = offfind.Indexer()
+    idx.rebuild([(str(data), True)], all_folder_modes=[(str(data), True)],
+                cancel_check=lambda: True)
+    assert idx.indexed_registrations() == set()
+
+
+def test_first_index_record_survives_restart(offfind, tmp_path):
+    """완료 기록은 색인 DB에 있으므로 앱을 재시작해도(새 Indexer) 유지된다 —
+    설정 파일에 두면 캐시 DB만 지웠을 때 기록이 어긋난다."""
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "a.txt").write_text("x", encoding="utf-8")
+    _rebuild(offfind, [(str(data), True)])
+
+    assert (_norm(data), True) in offfind.Indexer().indexed_registrations()
+
+
 def test_schema_migration_adds_missing_column(offfind, tmp_path):
     """예전 버전이 만든 DB(파싱 실패 컬럼 없음)를 열어도 자동으로 컬럼이 붙어야
     한다 — 안 붙으면 앱이 시작하자마자 SELECT 에서 죽는다."""
