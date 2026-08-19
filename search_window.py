@@ -28,11 +28,6 @@ from search_worker import SearchWorker
 # — 좌표상 정확히 맞닿게 배치해도 이음매에 미세한 픽셀 어긋남이 보일 수 있어서(실측
 # 확인), 팝업을 이만큼 입력창 쪽으로 살짝 겹치게 그린다(같은 배경색이라 겹쳐도 티 안 남).
 SEAM_OVERLAP = 1
-# 폴더 칩 스트립 아래에 항상 이만큼 공간을 잡아 둔다 — 칩이 넘칠 때만 나타나는
-# 가로 스크롤바가 이 안에 그려진다. 필요할 때만 높이를 늘리면 스크롤바가
-# 생겼다 사라질 때마다 창 높이가 들썩인다(창은 아래 기준으로 떠 있어서 위로
-# 튀어 보인다).
-CHIP_SCROLLBAR_RESERVE = 7
 MIN_QUERY_LENGTH = 2  # 한두 글자로는(특히 영문 한 글자) 결과가 너무 많아져 검색창이 멈춘 것처럼 느려짐
 # 결과 표시 개수 상한은 설정(settings.search_display_limit)에서 조절한다 —
 # _group_results()로 정렬/그룹핑하고 QListWidgetItem을 이 개수만큼 미리 다 만드는
@@ -287,25 +282,6 @@ STYLE = """
 #folderScroll {
     background: transparent;
     border: none;
-}
-#folderScroll QScrollBar:horizontal {
-    background: transparent;
-    height: 6px;
-    margin: 0;
-}
-#folderScroll QScrollBar::handle:horizontal {
-    background: rgba(255, 255, 255, 45);
-    border-radius: 3px;
-    min-width: 24px;
-}
-#folderScroll QScrollBar::handle:horizontal:hover {
-    background: rgba(255, 255, 255, 80);
-}
-#folderScroll QScrollBar::add-line:horizontal, #folderScroll QScrollBar::sub-line:horizontal {
-    width: 0px;
-}
-#folderScroll QScrollBar::add-page:horizontal, #folderScroll QScrollBar::sub-page:horizontal {
-    background: transparent;
 }
 """
 
@@ -1077,9 +1053,7 @@ class SearchWindow(QWidget):
         self.folder_row.setAttribute(Qt.WA_StyledBackground, True)
         self.folder_row.setVisible(False)
         folder_row_outer = QHBoxLayout(self.folder_row)
-        # 아래 여백은 스크롤바 예약 공간(CHIP_SCROLLBAR_RESERVE)이 대신한다 —
-        # 스크롤바가 안 보일 땐 그 공간이 그대로 여백처럼 보인다.
-        folder_row_outer.setContentsMargins(16, 2, 16, 2)
+        folder_row_outer.setContentsMargins(16, 1, 16, 4)
         folder_row_outer.setSpacing(0)
 
         self.folder_scroll = ChipScrollArea(self.folder_row)
@@ -1087,7 +1061,9 @@ class SearchWindow(QWidget):
         self.folder_scroll.setFrameShape(QFrame.NoFrame)
         self.folder_scroll.setWidgetResizable(True)
         self.folder_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.folder_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # 스크롤바 없이 휠로만 스크롤한다 — 바를 보이면(예전 버전) 칩 줄이 그만큼
+        # 두꺼워져서 검색창 전체가 예전과 달라 보인다는 피드백이 있었다.
+        self.folder_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         # QScrollArea 뷰포트는 기본적으로 자기 배경(회색)을 칠한다 — 카드의 어두운
         # 배경이 그대로 비치도록 꺼준다.
         self.folder_scroll.viewport().setAutoFillBackground(False)
@@ -1234,11 +1210,10 @@ class SearchWindow(QWidget):
             return
 
         chip_h = self._chip_height()
-        # 칩 높이 + 스크롤바 예약 공간으로 고정한다 — 레이아웃 sizeHint에 맡기면
-        # 재렌더 직후 잠깐 엉뚱한 값이 잡혀 창이 들썩이는 문제가 있었다(예전
-        # _base_height 관련 주석 참고). 칩이 넘칠 때만 나타나는 스크롤바도 이
-        # 예약 공간 안에 그려져서 높이가 변하지 않는다.
-        self.folder_scroll.setFixedHeight(chip_h + CHIP_SCROLLBAR_RESERVE)
+        # 스트립 높이 = 칩 높이로 고정한다(스크롤바는 안 보이니 여유 공간이 필요
+        # 없다) — 레이아웃 sizeHint에 맡기면 재렌더 직후 잠깐 엉뚱한 값이 잡혀
+        # 창이 들썩이는 문제가 있었다(예전 _base_height 관련 주석 참고).
+        self.folder_scroll.setFixedHeight(chip_h)
 
         for f, label in self._folder_chip_specs:
             btn = FolderChipButton(f, self.folder_row_layout, self.folder_scroll,
@@ -1270,10 +1245,7 @@ class SearchWindow(QWidget):
             else:
                 btn.setToolTip("")
             btn.toggled.connect(lambda checked, folder=f: self._on_chip_toggled(folder, checked))
-            # 칩을 위쪽에 붙인다 — 세로 가운데 정렬로 두면 스크롤바가 생기고
-            # 사라질 때마다(뷰포트 높이가 6px 변함) 칩이 위아래로 미세하게
-            # 움직여 보인다.
-            self.folder_row_layout.addWidget(btn, 0, Qt.AlignTop)
+            self.folder_row_layout.addWidget(btn)
         self.folder_row_layout.addStretch(1)
 
         # 색인 진행 상황이 연달아 들어오면(set_indexing_paths) 이 함수가 짧은
