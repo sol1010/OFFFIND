@@ -672,11 +672,14 @@ class FolderChipButton(QPushButton):
     """하단 폴더 칩 하나. 클릭은 켜기/끄기 토글, 좌우로 끌면 순서 변경.
 
     끌기 시작 전까지는 일반 버튼과 똑같다. 누른 지점에서 startDragDistance
-    이상 움직이면 그때부터 순서 변경 모드 — 레이아웃 안에서 자기 위치를
-    실시간으로 옮겨 미리보기처럼 보여주고, 놓는 순간 새 순서를 저장한다
-    (on_reordered 콜백). 순서 변경으로 끝난 드래그는 클릭으로 치지 않는다 —
-    super().mouseReleaseEvent를 안 불러서 놓는 순간 토글이 같이 일어나는 걸
-    막는다."""
+    이상 움직이면 그때부터 순서 변경 모드 — 칩을 레이아웃에서 잠깐 빼서 커서를
+    따라 실제로 움직여 보여주고(좌우로만 — 세로는 줄이 하나뿐이라 의미가 없다),
+    원래 자리에는 같은 크기의 투명 자리표시자를 넣어 "여기에 놓인다"는 빈 틈이
+    같이 움직이게 한다. 레이아웃에 넣은 채 move()해봐야 다음 레이아웃 패스에서
+    슬롯 위치로 강제 복귀해서 끌리는 모습이 전혀 안 보인다(그래서 빼는 것).
+    놓는 순간 자리표시자 위치로 들어가며 새 순서를 저장한다(on_reordered 콜백).
+    순서 변경으로 끝난 드래그는 클릭으로 치지 않는다 — super().mouseReleaseEvent를
+    안 불러서 놓는 순간 토글이 같이 일어나는 걸 막는다."""
 
     def __init__(self, folder_key: str, host_layout, scroll_area, on_reordered, parent=None):
         super().__init__(parent)
@@ -684,12 +687,16 @@ class FolderChipButton(QPushButton):
         self._host_layout = host_layout
         self._scroll_area = scroll_area
         self._on_reordered = on_reordered
-        self._press_pos = None
+        self._press_pos = None       # 전역 좌표 — 드래그 시작 판정용
+        self._press_local_x = 0      # 칩 안에서 누른 x — 끌 때 커서가 칩의 그 지점을 계속 잡고 있게
         self._dragging = False
+        self._placeholder = None
+        self._drag_y = 0
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._press_pos = event.globalPosition().toPoint()
+            self._press_local_x = event.position().toPoint().x()
             self._dragging = False
         super().mousePressEvent(event)
 
@@ -698,7 +705,7 @@ class FolderChipButton(QPushButton):
             gp = event.globalPosition().toPoint()
             if (not self._dragging
                     and (gp - self._press_pos).manhattanLength() >= QApplication.startDragDistance()):
-                self._dragging = True
+                self._begin_drag()
             if self._dragging:
                 self._drag_to(gp)
                 event.accept()
@@ -707,10 +714,7 @@ class FolderChipButton(QPushButton):
 
     def mouseReleaseEvent(self, event):
         if self._dragging and event.button() == Qt.LeftButton:
-            self._dragging = False
-            self._press_pos = None
-            self.setDown(False)
-            self._on_reordered()
+            self._end_drag()
             event.accept()
             return
         self._press_pos = None
@@ -724,21 +728,29 @@ class FolderChipButton(QPushButton):
                 chips.append(w)
         return chips
 
+    def _begin_drag(self):
+        self._dragging = True
+        self._drag_y = self.y()  # 세로는 이 값에 고정 — 좌우로만 끌린다
+        idx = self._chips().index(self)
+        self._host_layout.removeWidget(self)
+        self._placeholder = QWidget(self.parentWidget())
+        self._placeholder.setFixedSize(self.size())
+        self._host_layout.insertWidget(idx, self._placeholder)
+        self.raise_()  # 떠 있는 동안 다른 칩들 위로 지나가 보이게
+
     def _drag_to(self, global_pos):
         host = self.parentWidget()
-        x = host.mapFromGlobal(global_pos).x()
+        x = host.mapFromGlobal(global_pos).x() - self._press_local_x
+        x = max(0, min(x, host.width() - self.width()))
+        self.move(x, self._drag_y)
 
-        # 커서가 지나친 다른 칩 개수 = 목표 인덱스. 자기 자신은 빼고 세야
-        # 이동 후에도 인덱스 계산이 흔들리지 않는다.
-        chips = self._chips()
-        my_idx = chips.index(self)
-        others = [w for w in chips if w is not self]
-        target = sum(1 for w in others if x > w.x() + w.width() / 2)
-        if target != my_idx:
-            # 칩들은 항상 레이아웃 맨 앞에 연속으로 있고 그 뒤가 스트레치라,
-            # 칩 기준 인덱스를 레이아웃 인덱스로 그대로 써도 된다.
-            self._host_layout.removeWidget(self)
-            self._host_layout.insertWidget(target, self)
+        # 떠 있는 칩의 중심이 지나친 다른 칩 개수 = 자리표시자가 갈 인덱스.
+        center = x + self.width() / 2
+        others = self._chips()  # 나는 지금 레이아웃 밖이라 자동으로 빠져 있다
+        target = sum(1 for w in others if center > w.x() + w.width() / 2)
+        if self._host_layout.indexOf(self._placeholder) != target:
+            self._host_layout.removeWidget(self._placeholder)
+            self._host_layout.insertWidget(target, self._placeholder)
 
         # 뷰포트 가장자리 근처로 끌면 보이지 않는 칩 쪽으로 자동 스크롤.
         vp = self._scroll_area.viewport()
@@ -748,6 +760,17 @@ class FolderChipButton(QPushButton):
             bar.setValue(bar.value() - 12)
         elif vx > vp.width() - 24:
             bar.setValue(bar.value() + 12)
+
+    def _end_drag(self):
+        self._dragging = False
+        self._press_pos = None
+        idx = self._host_layout.indexOf(self._placeholder)
+        self._host_layout.removeWidget(self._placeholder)
+        self._placeholder.deleteLater()
+        self._placeholder = None
+        self._host_layout.insertWidget(idx, self)
+        self.setDown(False)
+        self._on_reordered()
 
 
 class DraggableRow(QFrame):
