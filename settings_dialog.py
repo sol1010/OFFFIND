@@ -532,6 +532,12 @@ class SettingsDialog(QDialog):
         self.always_on_top_cb.setChecked(self.settings.always_on_top)
         form.addRow(self.always_on_top_cb)
 
+        self.keep_visible_cb = QCheckBox("항상 떠있기 (다른 곳을 클릭해도 닫히지 않음)")
+        self.keep_visible_cb.setToolTip("검색창이 포커스를 잃거나 결과 파일을 열어도 닫히지 않습니다.\n"
+                                        "Esc 또는 전역 단축키로만 숨겨지고, 앱 시작 시에도 바로 떠 있습니다.")
+        self.keep_visible_cb.setChecked(self.settings.keep_visible)
+        form.addRow(self.keep_visible_cb)
+
         opacity_row = QHBoxLayout()
         self.opacity_slider = NoScrollSlider(Qt.Horizontal)
         self.opacity_slider.setRange(30, 100)
@@ -1211,6 +1217,7 @@ class SettingsDialog(QDialog):
             return
 
         self.settings.always_on_top = self.always_on_top_cb.isChecked()
+        self.settings.keep_visible = self.keep_visible_cb.isChecked()
         self.settings.opacity = self.opacity_slider.value() / 100.0
         self.settings.hotkey = hotkey
         self.settings.width_percent = self.width_slider.value() / 100.0

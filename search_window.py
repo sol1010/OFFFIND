@@ -1586,7 +1586,9 @@ class SearchWindow(QWidget):
             # 있었다 — 메뉴가 떠 있는 동안은 무시한다.
             if self._context_menu_open:
                 return super().event(e)
-            self.hide_window()
+            # "항상 떠있기"면 포커스를 잃어도 안 닫는다 — Esc/단축키로만 숨긴다.
+            if not self.settings.keep_visible:
+                self.hide_window()
         return super().event(e)
 
     # ---------- 검색 ----------
@@ -2086,7 +2088,10 @@ class SearchWindow(QWidget):
         if idx is None or idx >= len(self._results):
             return
         open_result(self._results[idx])
-        self.hide_window()
+        # "항상 떠있기"면 파일을 열어도 검색창을 그대로 둔다 — 같은 검색 결과에서
+        # 여러 파일을 연달아 열어보는 흐름이 자연스러워진다.
+        if not self.settings.keep_visible:
+            self.hide_window()
 
     def _show_result_context_menu(self, pos):
         row = self.results_list.indexAt(pos).row()
@@ -2113,9 +2118,11 @@ class SearchWindow(QWidget):
 
         if chosen == open_action:
             open_result(result)
-            self.hide_window()
+            if not self.settings.keep_visible:
+                self.hide_window()
         elif chosen == open_folder_action:
             open_containing_folder(path)
-            self.hide_window()
+            if not self.settings.keep_visible:
+                self.hide_window()
         elif chosen == copy_path_action:
             QApplication.clipboard().setText(path)

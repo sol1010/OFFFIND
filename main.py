@@ -61,6 +61,9 @@ class App:
 
         if self.settings.folders:
             self._start_indexing()
+            # "항상 떠있기"면 단축키를 기다리지 않고 시작하자마자 검색창을 띄운다.
+            if self.settings.keep_visible:
+                self.search_window.show_window()
         else:
             self.open_settings()
 
@@ -284,6 +287,10 @@ class App:
         # 강제 전경화만 다음 이벤트 루프 틱으로 미뤄서 따로 적용한다.
         QTimer.singleShot(0, lambda: win_focus.force_foreground(int(dialog.winId())))
         dialog.exec()
+        # 설정창이 닫힌 뒤에 띄운다 — 설정창이 떠 있는 동안 검색창을 같이 띄우면
+        # 포커스 쟁탈전이 난다(이 함수 첫머리에서 검색창을 미리 닫는 것과 같은 이유).
+        if self.settings.keep_visible and self.settings.folders and not self.search_window.isVisible():
+            self.search_window.show_window()
 
     def quit(self):
         self.hotkey_manager.unregister()

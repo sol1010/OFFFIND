@@ -31,6 +31,9 @@ DEFAULTS = {
     "folders": [],
     "hotkey": "ctrl+space",
     "always_on_top": True,
+    # 항상 떠있기: 켜면 검색창이 포커스를 잃거나(다른 곳 클릭) 결과 파일을 열어도
+    # 자동으로 닫히지 않는다 — Esc/전역 단축키로만 숨긴다. 앱 시작 때도 바로 띄운다.
+    "keep_visible": False,
     "opacity": 0.97,
     "width_percent": 0.4,
     "max_height_percent": 0.7,
@@ -59,6 +62,7 @@ class Settings:
     folders: List[str] = field(default_factory=list)
     hotkey: str = DEFAULTS["hotkey"]
     always_on_top: bool = DEFAULTS["always_on_top"]
+    keep_visible: bool = DEFAULTS["keep_visible"]
     opacity: float = DEFAULTS["opacity"]
     width_percent: float = DEFAULTS["width_percent"]
     max_height_percent: float = DEFAULTS["max_height_percent"]
