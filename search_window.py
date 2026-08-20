@@ -5,9 +5,11 @@
 import math
 import os
 
-from PySide6.QtCore import Qt, QTimer, Signal, QEvent, QPoint, QPointF, QRect, QRectF, QSize
+from PySide6.QtCore import (
+    Qt, QTimer, Signal, QEvent, QMimeData, QPoint, QPointF, QRect, QRectF, QSize, QUrl,
+)
 from PySide6.QtGui import (
-    QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QIcon, QImage, QKeySequence,
+    QColor, QCursor, QDrag, QFont, QFontMetrics, QGuiApplication, QIcon, QImage, QKeySequence,
     QPainter, QPen, QPixmap, QShortcut, QTextCharFormat, QTextLayout,
 )
 from PySide6.QtWidgets import (
@@ -596,12 +598,19 @@ HEADER_KINDS = ("folder", "member", "category")
 
 class ResultsListWidget(QListWidget):
     """헤더(폴더/그룹 멤버/카테고리) 행 클릭을 감지해 콜백으로 넘기고, 그 위에서는
-    커서를 손가락 모양으로 바꿔 클릭 가능함을 알려준다."""
+    커서를 손가락 모양으로 바꿔 클릭 가능함을 알려준다.
+
+    결과 행은 창 밖으로 끌어낼 수 있다(파일 드래그 아웃) — 탐색기·바탕화면·다른
+    앱으로 끌어다 놓으면 그 파일이 복사된다. 이동이 아니라 복사만 허용한다:
+    이동을 허용하면 같은 드라이브의 탐색기 폴더에 놓는 순간 Windows 기본 동작이
+    '이동'이라, 검색해서 찾은 원본이 색인된 폴더에서 소리 없이 빠져나가 버린다."""
 
     def __init__(self, on_header_click, parent=None):
         super().__init__(parent)
         self._on_header_click = on_header_click
         self.setMouseTracking(True)
+        self._drag_press_pos = None  # 전역 좌표 — 드래그 시작 판정용
+        self._drag_path = None       # 눌린 결과 행의 파일 경로
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -609,6 +618,11 @@ class ResultsListWidget(QListWidget):
             if idx.isValid():
                 payload = idx.data(Qt.UserRole) or {}
                 kind = payload.get("kind")
+                if kind == "result":
+                    # 지금은 누르기만 한 상태 — 실제 드래그는 mouseMoveEvent에서
+                    # 거리 문턱을 넘었을 때만 시작한다(클릭/더블클릭과 공존).
+                    self._drag_press_pos = event.globalPosition().toPoint()
+                    self._drag_path = (payload.get("result") or {}).get("path")
                 if kind in ("category", "folder"):
                     # 카테고리/폴더 헤더는 이제 선택도 가능하다 — 이름 글자 위를
                     # 클릭했을 때만 접기/펼치기, 그 옆 빈 영역은 그냥 선택만 되게
@@ -659,6 +673,21 @@ class ResultsListWidget(QListWidget):
         return text_left <= pos.x() <= text_left + text_width
 
     def mouseMoveEvent(self, event):
+        # 결과 행을 누른 채 문턱 거리 이상 움직이면 파일 드래그 아웃 시작.
+        if (self._drag_press_pos is not None and self._drag_path
+                and (event.buttons() & Qt.LeftButton)
+                and (event.globalPosition().toPoint() - self._drag_press_pos).manhattanLength()
+                    >= QApplication.startDragDistance()):
+            path = self._drag_path
+            self._drag_press_pos = None
+            self._drag_path = None
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setUrls([QUrl.fromLocalFile(path)])
+            drag.setMimeData(mime)
+            drag.exec(Qt.CopyAction)  # 복사만 — 클래스 주석 참고
+            return
+
         pos = event.position().toPoint()
         idx = self.indexAt(pos)
         payload = (idx.data(Qt.UserRole) or {}) if idx.isValid() else {}
@@ -669,6 +698,11 @@ class ResultsListWidget(QListWidget):
             hand = kind in HEADER_KINDS
         self.viewport().setCursor(Qt.PointingHandCursor if hand else Qt.ArrowCursor)
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_press_pos = None
+        self._drag_path = None
+        super().mouseReleaseEvent(event)
 
 
 class ChipScrollArea(QScrollArea):
