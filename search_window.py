@@ -26,6 +26,7 @@ import win_focus
 from indexer import _is_under as _path_is_under
 from file_opener import open_result, open_containing_folder
 from search_worker import SearchWorker
+from shell_drag import shell_idlist_bytes, SHELL_IDLIST_MIME
 
 # 입력창과 결과 팝업은 서로 다른 최상위 창이라 OS가 각자 따로 그리고 앤티에일리어싱한다
 # — 좌표상 정확히 맞닿게 배치해도 이음매에 미세한 픽셀 어긋남이 보일 수 있어서(실측
@@ -713,6 +714,12 @@ class ResultsListWidget(QListWidget):
             drag = QDrag(self)
             mime = QMimeData()
             mime.setUrls([QUrl.fromLocalFile(path)])
+            # 탐색기끼리의 드래그처럼 보이게 하는 셸 데이터 — 이게 있어야
+            # 바탕화면/폴더에 놓았을 때 아이콘이 "놓은 자리"에 생기고 새로고침해도
+            # 그 자리를 유지한다(없으면 임의의 빈 칸에 생겼다가 자리가 또 바뀐다).
+            idlist = shell_idlist_bytes(path)
+            if idlist:
+                mime.setData(SHELL_IDLIST_MIME, idlist)
             drag.setMimeData(mime)
             pm = _file_drag_pixmap(path)
             drag.setPixmap(pm)
