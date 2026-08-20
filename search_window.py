@@ -6,7 +6,8 @@ import math
 import os
 
 from PySide6.QtCore import (
-    Qt, QTimer, Signal, QEvent, QMimeData, QPoint, QPointF, QRect, QRectF, QSize, QUrl,
+    Qt, QTimer, Signal, QEvent, QFileInfo, QMimeData, QPoint, QPointF, QRect, QRectF,
+    QSize, QUrl,
 )
 from PySide6.QtGui import (
     QColor, QCursor, QDrag, QFont, QFontMetrics, QGuiApplication, QIcon, QImage, QKeySequence,
@@ -15,7 +16,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QLabel, QToolButton,
     QListWidget, QListWidgetItem, QFrame, QSizePolicy, QPushButton,
-    QStyle, QStyledItemDelegate, QMenu, QApplication, QScrollArea,
+    QStyle, QStyledItemDelegate, QMenu, QApplication, QScrollArea, QFileIconProvider,
 )
 
 import win_focus
@@ -360,6 +361,34 @@ def _px_font(px: int, weight: QFont.Weight = QFont.Normal) -> QFont:
     return f
 
 
+def _file_drag_pixmap(path: str) -> QPixmap:
+    """결과 행을 창 밖으로 끌 때 커서를 따라다니는 미리보기 — 실제 파일의 셸
+    아이콘 + 파일명이 든 작은 알약. 이게 없으면 커서만 덜렁 움직여서 뭘 끌고
+    있는지 안 보인다."""
+    name = os.path.basename(path.rstrip("\\/")) or path
+    font = _px_font(12)
+    fm = QFontMetrics(font)
+    text = fm.elidedText(name, Qt.ElideMiddle, 240)
+    icon_px = QFileIconProvider().icon(QFileInfo(path)).pixmap(20, 20)
+
+    pad, gap, icon_w = 9, 6, 20
+    w = pad + icon_w + gap + fm.horizontalAdvance(text) + pad
+    h = 30
+    image = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+    image.fill(Qt.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setPen(QPen(QColor(255, 255, 255, 40)))
+    painter.setBrush(QColor(32, 33, 36, 235))  # 앱 카드와 같은 어두운 톤
+    painter.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 8, 8)
+    painter.drawPixmap(pad, (h - icon_w) // 2, icon_px)
+    painter.setPen(QColor("#e8eaed"))
+    painter.setFont(font)
+    painter.drawText(QRect(pad + icon_w + gap, 0, w, h), Qt.AlignVCenter | Qt.AlignLeft, text)
+    painter.end()
+    return QPixmap.fromImage(image)
+
+
 class ResultDelegate(QStyledItemDelegate):
     """결과 목록의 각 행을 실제 QWidget 없이 직접 그린다(Everything 같은 파일 검색기가
     수만 건도 가볍게 보여주는 방식과 동일 — 화면에 실제로 보이는 행만 paint()가 호출된다).
@@ -685,6 +714,11 @@ class ResultsListWidget(QListWidget):
             mime = QMimeData()
             mime.setUrls([QUrl.fromLocalFile(path)])
             drag.setMimeData(mime)
+            pm = _file_drag_pixmap(path)
+            drag.setPixmap(pm)
+            # 커서가 알약의 아이콘 부근(왼쪽 가운데)을 잡게 한다 — 파일명이
+            # 커서 오른쪽으로 뻗어서 뭘 끌고 있는지 잘 보인다.
+            drag.setHotSpot(QPoint(12, pm.height() // 2))
             drag.exec(Qt.CopyAction)  # 복사만 — 클래스 주석 참고
             return
 
