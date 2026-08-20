@@ -482,6 +482,13 @@ class Indexer:
         # 뼈아팠음 — 실측으로 확인함: 재시작할 때마다 매번 처음부터). 일정量 쌓일
         # 때마다 중간 커밋해서, 죽거나 취소돼도 그때까지 훑은 건 남게 한다.
         FLUSH_EVERY = 300
+        # 내용 파싱은 파일명 나열과 시간 단위가 다르다 — 스캔본 PDF는 한 파일에
+        # 수 초~수십 초씩 걸려서, 300개를 채우려면 한 시간을 넘게 파싱하고도 DB에
+        # 하나도 저장이 안 된 상태가 된다(실측: 자재승인원 5,300개 폴더를 1시간
+        # 넘게 갈았는데 커밋 0건 — 그 사이 앱을 재시작하면 전부 다시). 무거운
+        # 쪽은 훨씬 자주 커밋해서 진행이 유실되지 않고, 색인된 것부터 바로
+        # 검색되게 한다(커밋이 잦아지는 비용은 파싱 시간에 비하면 무시할 수준).
+        CONTENT_FLUSH_EVERY = 25
 
         def _flush():
             if not pending and not content_pending and not downgrade_norms:
@@ -526,7 +533,8 @@ class Indexer:
             downgrade_norms.clear()
 
         def _maybe_flush():
-            if len(pending) + len(content_pending) >= FLUSH_EVERY:
+            if (len(content_pending) >= CONTENT_FLUSH_EVERY
+                    or len(pending) + len(content_pending) >= FLUSH_EVERY):
                 _flush()
 
         def _queue_plain(path, path_norm, name, is_dir):
